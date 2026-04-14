@@ -1,0 +1,66 @@
+clear all;
+clc;
+
+dt = 0.1;
+T = 1000;
+t = 0 : dt : T;
+N = length(t);
+
+
+
+% 初始状态设置
+p0 = [0,0,0];
+v0 = [2500,0,0];
+H0 = 30e3;
+
+
+
+tar0 = [8000e3,0,0];
+
+v = v0;
+
+for  i = 1 : N
+
+% 动力学计算
+%% 重力计算--最后在惯性坐标系下计算
+% 输入：ECI位置r = [x; y; z]
+r = sqrt(x^2 + y^2 + z^2);
+r5 = r^5;
+z2_over_r2 = (z/r)^2;
+mu = 3.986004418e14;
+J2 = 1.08263e-3;
+Re = 6378137; 
+
+% 点质量项
+g0 = -mu / r^3 * [x; y; z];
+
+% J2修正项
+gx = 3*mu*J2*Re^2/(2*r^5) * x * (1 - 5*(z/r)^2);
+gy = 3*mu*J2*Re^2/(2*r^5) * y * (1 - 5*(z/r)^2);
+gz = 3*mu*J2*Re^2/(2*r^5) * z * (3 - 5*(z/r)^2);
+gJ2 = [gx; gy; gz];
+
+% 总引力加速度
+g_eci = g0 + gJ2;
+
+%% 气动力计算--速度系下计算--转机体系下
+% 速度与姿态
+V   = sqrt(v(1)^2+v(2)^2+v(3)^2);
+alpha = atan2(v(3),v(1));
+beta  = atan2(v(2), sqrt(v(1)^2+v(3)^2));
+
+% 高度（NED）
+H = -v(3);
+
+% 大气
+[a, rho] = atmos_simple(H);
+Ma = V / a;  
+% 动压
+qbar = 0.5*rho*V^2;
+S_ref   = 0.2986;      % 参考面积 (m^2)
+[CL, CD, CY, Cl, Cm, Cn] = aero_coeffs(Ma, alpha, beta, de1, de2, dr, dT);
+L = CL * qbar * S_ref ;
+D = CD * qbar * S_ref ;
+Y = CY * qbar * S_ref ;
+
+end

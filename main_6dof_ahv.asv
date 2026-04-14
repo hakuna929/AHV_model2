@@ -1,0 +1,66 @@
+clear; clc;
+
+% 飞行器参数
+p = ahv_params();   % 结构体
+
+% 初始条件（可按表 3‑2 选一个工况）
+H0   = 30e3;        % 初始高度 30 km
+Ma0  = 6;           % 初始马赫数
+alpha0 = 5;  % 攻角 5 deg
+beta0  = 0;  % 侧滑角 0 deg
+gamma0 = 0;  % 轨迹倾角
+chi0   = 0*pi/180;  % 航向角
+
+% 大气与声速（这里只给简单模型，可替换成更精确 ISA）
+[a0, rho0] = atmos_simple(H0);
+V0 = Ma0 * a0;
+
+% 将轨迹角/攻角/侧滑角换成机体速度分量
+% 假设初始航迹与机体轴对齐，只使用攻角/侧滑近似：
+u0 = V0*cos(alpha0)*cos(beta0);
+v0 = V0*cos(alpha0)*sin(beta0);
+w0 = V0*sin(alpha0);
+
+% 初始姿态：俯仰角近似等于攻角，滚转、偏航取 0
+phi0   = 0;
+theta0 = alpha0;
+psi0   = 0;
+
+p0 = 0; q0 = 0; r0 = 0;
+
+x0 = 0; y0 = 0; z0 = -H0;   % NED: 高度 H = -z
+mf0 = p.mf;                 % 初始燃料质量
+
+X0 = [x0; y0; z0; u0; v0; w0; phi0; theta0; psi0; p0; q0; r0; mf0];
+
+% 控制输入（可做函数，这里先简单恒定）
+delta_e1 = 0*pi/180; % 左翼升降舵
+delta_e2 = 0*pi/180; % 右翼升降舵
+delta_r  = 0*pi/180; % 方向舵
+delta_T  = 1.0;      % 推力节流阀开度 (0~1)
+delta_f  = 0*pi/180; % 抬头舵/襟翼等，如有
+
+U = [delta_e1; delta_e2; delta_r; delta_T; delta_f];
+
+% 4) 积分仿真
+tspan = [0 50];      % 仿真 50 s
+opts  = odeset('RelTol',1e-6,'AbsTol',1e-8);
+
+[t, X] = ode45(@(t,x) ahv_6dof_ode(t,x,U,p), tspan, X0, opts);
+
+% 5) 结果简单作图
+figure;
+subplot(3,1,1);
+plot(t, -X(:,3)/1000); grid on;
+ylabel('H (km)');
+
+subplot(3,1,2);
+V = sqrt(X(:,4).^2 + X(:,5).^2 + X(:,6).^2);
+plot(t, V); grid on;
+ylabel('V (m/s)');
+
+subplot(3,1,3);
+plot(t, X(:,8)*180/pi); grid on;
+ylabel('\theta (deg)');
+xlabel('t (s)');
+title('AHV 6DOF Simulation');
