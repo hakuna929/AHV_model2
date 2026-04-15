@@ -2,8 +2,8 @@ clear;
 clc;
 
 %% 时间
-dt = 0.001;
-T  = 400;
+dt = 0.1;
+T  = 2000;
 t  = 0:dt:T;
 N  = numel(t);
 
@@ -75,8 +75,10 @@ Kv = 0.0015;
 Rhist = zeros(N,3);
 Vhist = zeros(N,3);
 Hhist = zeros(N,1);
+Dist_hist = zeros(N,1); % 记录目标与飞行器的实时距离
 
 inf_time = N;
+
 
 for k=1:N
     %% 地理量
@@ -84,12 +86,14 @@ for k=1:N
     [lat, lon, h] = ecef2lla_wgs84(r');  
     Hhist(k)=h;
 
+
     % 防止飞行器高度过低，终止仿真
-    if h <= 20e3
+    if h <= 0
         fprintf('Vehicle crashed into the ground at t=%.2f s\n', t(k));
         Rhist = Rhist(1:k,:);
         Vhist = Vhist(1:k,:);
         Hhist = Hhist(1:k,:);
+        Dist_hist = Dist_hist(1:k,:); % 截断距离记录数组
         inf_time = k;
         break;
     end
@@ -137,8 +141,10 @@ for k=1:N
     
     % 气动数据查表保护，防止马赫数外推爆炸
     Ma = max(min(Ma, 7.0), 0.0); % 假设最大支持马赫数为10.0，视情况调整
-    
+
+    % 动压：qbar
     qbar = 0.5*rho*Vair^2;
+
 
     %% 重力
     x=r(1); y=r(2); z=r(3); rr=max(norm(r),Re+1);
@@ -177,6 +183,7 @@ for k=1:N
     else
         chi_cmd = psi;
     end
+    
 
     theta_cmd = atan2(a_vert,gmag);
     theta_cmd = max(min(theta_cmd,10*pi/180),-10*pi/180);
@@ -190,13 +197,12 @@ for k=1:N
     theta = theta_cmd;
     psi = psi_cmd;
 
-    % 推力速度环 (PI控制或带dt的积分控制)
+    % 推力速度环 
     err_v = V_cmd - Vair;
-    % Kv 这里如果是积分增益，必须乘上 dt
     dT = dT + Kv * err_v * dt;  
     
     % 为了防止超速时推力降不下来，可以将下限适当放宽至0或者发动机允许的真实关断下限
-    dT = max(min(dT, 1.0), 0.0); 
+    dT = max(min(dT, 1.0), 0.1); 
 
     %% 气动与推力 (不计算力矩，只需气动力)
     % 添加超速时的强行阻力干预 (可选的飞行走廊保护)
@@ -228,6 +234,7 @@ for k=1:N
     %% 记录
     Rhist(k,:)=r.';
     Vhist(k,:)=v.';
+    Dist_hist(k) = norm(rT - r); % 新增：记录当前时刻的真实相对距离
 
     %% 命中判据
     if R_dist < 5e3
@@ -235,6 +242,7 @@ for k=1:N
         Rhist = Rhist(1:k,:);
         Vhist = Vhist(1:k,:);
         Hhist = Hhist(1:k,:);
+        Dist_hist = Dist_hist(1:k,:); % 截断距离记录数组
         inf_time = k;
         break;
     end
@@ -256,3 +264,11 @@ title('Cruise Trajectory in ECI (3-DOF)');
 % [xe,ye,ze]=sphere(60);
 % surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
 % legend('Vehicle Trajectory','Earth');
+
+%% 实时相对距离变化曲线绘制
+figure;
+plot(t(1:inf_time), Dist_hist(1:inf_time) / 1000, 'm-', 'LineWidth', 1.5);
+grid on;
+xlabel('Time (s)');
+ylabel('Distance to Target (km)');
+title('Real-time Distance between Vehicle and Target');

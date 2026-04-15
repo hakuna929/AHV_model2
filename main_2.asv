@@ -1,4 +1,5 @@
-clear; clc;
+clear;
+clc;
 
 %% 时间
 dt = 0.001;
@@ -54,14 +55,15 @@ phi   = atan2(C_b2i_0(3,2), C_b2i_0(3,3));
 % 舵面默认值 (3自由度下忽略舵面对力的影响或设为0)
 de1=0; de2=0; dr=0; dT=1;
 
-%% 目标点设置（与起点球面距离）
-R0 = Re + h0;
-s_target = 1000e3;
-sigma = s_target / R0;
-az0 = chi0;
-n_gc = cos(az0)*eN + sin(az0)*eE;
-rT = R0*(cos(sigma)*(r0_ecef/R0) + sin(sigma)*n_gc);
-vT = [0;0;0];
+%% 目标点设置（经纬高转ECEF/ECI）
+h_T = h0;                   % 目标高度与飞行器初始高度一致
+lat_T = 13.35;
+lon_T = 144.55;
+
+% 经纬高转换为 ECEF (此处将其视为瞬时惯性系下的固定目标点)
+rT = lla2ecef_wgs84(lat_T, lon_T, h_T);
+rT = rT(:); % 确保是列向量 3x1
+vT = [0; 0; 0];
 
 %% 控制参数
 Npn = 3.0;
@@ -76,14 +78,16 @@ Hhist = zeros(N,1);
 
 inf_time = N;
 
+
 for k=1:N
     %% 地理量
     rn = norm(r); ur = r/rn;
     [lat, lon, h] = ecef2lla_wgs84(r');  
     Hhist(k)=h;
 
+
     % 防止飞行器高度过低，终止仿真
-    if h <= 25e3
+    if h <= 20e3
         fprintf('Vehicle crashed into the ground at t=%.2f s\n', t(k));
         Rhist = Rhist(1:k,:);
         Vhist = Vhist(1:k,:);
@@ -96,11 +100,27 @@ for k=1:N
     v_air_eci = v - cross(omega_ie,r);
     Vair = max(norm(v_air_eci),1e-3);
 
-    %% 姿态矩阵 (基于理想跟踪后的当前姿态角)
+    %% 姿态矩阵 
+    % 1. 先计算从 机体系(Body) 到 当地导航系(NED) 的旋转矩阵
+    % 这里的 phi, theta, psi 是相对于 NED 系的欧拉角
     cph=cos(phi); sph=sin(phi); cth=cos(theta); sth=sin(theta); cps=cos(psi); sps=sin(psi);
-    Ci_b = [cth*cps, sph*sth*cps-cph*sps, cph*sth*cps+sph*sps;
-            cth*sps, sph*sth*sps+cph*cps, cph*sth*sps-sph*cps;
-            -sth,    sph*cth,             cph*cth];
+    Cned_b = [cth*cps, sph*sth*cps-cph*sps, cph*sth*cps+sph*sps;
+              cth*sps, sph*sth*sps+cph*cps, cph*sth*sps-sph*cps;
+              -sth,    sph*cth,             cph*cth];
+          
+    % 2. 计算从 当地导航系(NED) 到 惯性系(ECI) 的旋转矩阵
+    % 根据当前位置的经纬度计算当地 NED 系在 ECI 系下的方向基向量
+    slat = sin(lat); clat = cos(lat);
+    slon = sin(lon); clon = cos(lon);
+    
+    eN_eci = [-slat*clon; -slat*slon; clat]; % 北向
+    eE_eci = [-slon;      clon;       0   ]; % 东向
+    eD_eci = [-clat*clon; -clat*slon; -slat]; % 地向 (Down, 指向地心)
+    
+    Ci_ned = [eN_eci, eE_eci, eD_eci]; % NED 到 ECI 的转换矩阵
+    
+    % 3. 得到最终的 机体 到 ECI 的转换矩阵
+    Ci_b = Ci_ned * Cned_b;
     Cb_i = Ci_b';
 
     %% 空速到机体系 (计算迎角侧滑角)
@@ -119,8 +139,17 @@ for k=1:N
     
     % 气动数据查表保护，防止马赫数外推爆炸
     Ma = max(min(Ma, 7.0), 0.0); % 假设最大支持马赫数为10.0，视情况调整
-    
+
+    %% 飞行走廊变量计算
+    % 1. 动压（已计算）：qbar
     qbar = 0.5*rho*Vair^2;
+    
+    % 2. 驻点热流密度计算 (Sutton-Graves 经验公式)
+    Q_dot = C_Q * sqrt(rho) * Vair^3; 
+    
+    % 3. 近似法向过载预测 (利用当前的 alpha 和 qbar 预测升力过载)
+    % 这里用查表或简单公式得到当前的升力系数，为了简单，可用上一步的L或近似估算
+    % 或者放在气动力计算之后进行监控
 
     %% 重力
     x=r(1); y=r(2); z=r(3); rr=max(norm(r),Re+1);
@@ -159,6 +188,24 @@ for k=1:N
     else
         chi_cmd = psi;
     end
+    
+  %% ========== 飞行走廊保护机制 ==========
+    % 1. 动压过大 / 热流过大 -> 需要拉高高度（产生向上的加速度）或减速
+    if Q_dot > Q_dot_max || qbar > q_max
+        % 覆盖PN制导指令，强制产生向上的法向加速度
+        a_vert_corr = 0.5 * gmag; % 强行给一个向上的修正量（可调）
+        a_vert = max(a_vert, a_vert_corr);
+        
+        % 降低推力或打开减速板
+        dT = dT - 0.1 * dt; 
+    end
+    
+    % 2. 动压过小 -> 无法维持气动控制，需要降低高度
+    if qbar < q_min
+        % 覆盖PN制导指令，强制产生向下的法向加速度
+        a_vert_corr = -0.5 * gmag; 
+        a_vert = min(a_vert, a_vert_corr);
+    end
 
     theta_cmd = atan2(a_vert,gmag);
     theta_cmd = max(min(theta_cmd,10*pi/180),-10*pi/180);
@@ -172,7 +219,7 @@ for k=1:N
     theta = theta_cmd;
     psi = psi_cmd;
 
-    % 【修改】推力速度环 (PI控制或带dt的积分控制)
+    % 推力速度环 (PI控制或带dt的积分控制)
     err_v = V_cmd - Vair;
     % Kv 这里如果是积分增益，必须乘上 dt
     dT = dT + Kv * err_v * dt;  
@@ -189,6 +236,16 @@ for k=1:N
     %% 气动与推力 (不计算力矩，只需气动力)
     [CL,CD,CY,~,~,~] = aero_coeffs(Ma,alpha,beta,de1,de2,dr,dT); % 忽略力矩项
     L = CL*qbar*S_ref; D=CD*qbar*S_ref; Y=CY*qbar*S_ref;
+
+    % 计算当前法向过载
+    n_current = sqrt(L^2 + Y^2) / (m * g0_earth);
+
+    % 3. 过载过大 -> 限制迎角 (在下一次循环生效) 或限制当前的制导加速度指令
+    if n_current > n_max
+        % 你可以通过限制 a_cmd_eci 的模长来实现
+        % 或者直接限制 alpha
+        alpha = alpha * (n_max / n_current); % 简单的缩放限幅
+    end
     Fw = [-D;Y;-L];
 
     ca=cos(alpha); sa=sin(alpha); cb=cos(beta); sb=sin(beta);
@@ -210,6 +267,9 @@ for k=1:N
     %% 记录
     Rhist(k,:)=r.';
     Vhist(k,:)=v.';
+    Qhist(k) = Q_dot;
+    qhist(k) = qbar;
+    nhist(k) = n_current;
 
     %% 命中判据
     if R_dist < 5e3
@@ -235,6 +295,53 @@ plot3(Rhist(1:inf_time,1)/1e3,Rhist(1:inf_time,2)/1e3,Rhist(1:inf_time,3)/1e3,'b
 xlabel('X_{ECI} (km)'); ylabel('Y_{ECI} (km)'); zlabel('Z_{ECI} (km)');
 title('Cruise Trajectory in ECI (3-DOF)');
 
-[xe,ye,ze]=sphere(60);
-surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
-legend('Vehicle Trajectory','Earth');
+% [xe,ye,ze]=sphere(60);
+% surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
+% legend('Vehicle Trajectory','Earth');
+
+%% 飞行走廊绘制 (H-V 剖面图)
+figure;
+
+% 1. 提取实际飞行速度大小（取 Vhist 的模长）
+V_mag_hist = zeros(inf_time, 1);
+for i = 1:inf_time
+    V_mag_hist(i) = norm(Vhist(i, :));
+end
+
+% 2. 绘制实际飞行轨迹
+plot(V_mag_hist, Hhist(1:inf_time)/1000, 'b-', 'LineWidth', 1.5);
+hold on; grid on;
+xlabel('Velocity (m/s)');
+ylabel('Altitude (km)');
+title('Flight Corridor (H-V Profile)');
+
+% 3. 生成走廊背景网格
+v_mesh = linspace(1000, 3500, 100);  % 速度范围 (m/s)，可根据你的实际情况调整
+h_mesh = linspace(20e3, 60e3, 100);  % 高度范围 (m)
+[V_grid, H_grid] = meshgrid(v_mesh, h_mesh);
+
+% 4. 使用你已有的 atmos_simple 函数计算网格密度
+Rho_grid = zeros(size(H_grid));
+for i = 1:size(H_grid, 1)
+    for j = 1:size(H_grid, 2)
+        [~, rho_val] = atmos_simple(H_grid(i,j)); % 提取第二个输出：密度
+        Rho_grid(i,j) = rho_val;
+    end
+end
+
+% 5. 计算网格上的热流和动压
+% 注意：C_Q, Q_dot_max, q_max, q_min 需要在脚本开头定义过
+if ~exist('C_Q', 'var'), C_Q = 1.83e-4; end
+if ~exist('Q_dot_max', 'var'), Q_dot_max = 2.5e6; end
+if ~exist('q_max', 'var'), q_max = 100e3; end
+if ~exist('q_min', 'var'), q_min = 20e3; end
+
+Q_grid = C_Q .* sqrt(Rho_grid) .* V_grid.^3;
+q_grid = 0.5 .* Rho_grid .* V_grid.^2;
+
+% 6. 画出约束边界等高线
+contour(V_grid, H_grid/1000, Q_grid, [Q_dot_max Q_dot_max], 'r--', 'LineWidth', 2);
+contour(V_grid, H_grid/1000, q_grid, [q_max q_max], 'k--', 'LineWidth', 2);
+contour(V_grid, H_grid/1000, q_grid, [q_min q_min], 'k-.', 'LineWidth', 2);
+
+legend('Trajectory', 'Max Heating Rate', 'Max Dynamic Pressure', 'Min Dynamic Pressure');
