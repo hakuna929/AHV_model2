@@ -30,12 +30,12 @@ Ma_r = 6.5; %期望巡航马赫数
 [a0,rh0_0] = atmos_simple(h0);
 V0 = Ma_r * a0;   %巡航速度
 
-chi0 = 30*pi/180; %航迹方位角/航向角 
-gamma0 = 0*pi/180;  %航迹倾斜角/飞行路径角
-eE = [-sin(lon0); cos(lon0); 0];
-eN = [-sin(lat0)*cos(lon0); -sin(lat0)*sin(lon0); cos(lat0)];
-eU = [cos(lat0)*cos(lon0); cos(lat0)*sin(lon0); sin(lat0)];
-v_rel0 = V0*(cos(gamma0)*cos(chi0)*eN + cos(gamma0)*sin(chi0)*eE + sin(gamma0)*eU);
+chi0 = 30; %航迹方位角/航向角 
+gamma0 = 0;  %航迹倾斜角/飞行路径角
+eE = [-sind(lon0); cosd(lon0); 0];
+eN = [-sind(lat0)*cosd(lon0); -sind(lat0)*sind(lon0); cosd(lat0)];
+eU = [cosd(lat0)*cosd(lon0); cosd(lat0)*sind(lon0); sind(lat0)];
+v_rel0 = V0*(cosd(gamma0)*cosd(chi0)*eN + cosd(gamma0)*sind(chi0)*eE + sind(gamma0)*eU);
 v = v_rel0 + cross(omega_ie,r);
 
 % 姿态初始化
@@ -66,7 +66,7 @@ vT = [0;0;0];
 %% 控制参数
 Npn = 3.0;
 a_cmd_max = 30;             % m/s^2
-V_cmd = 2500;
+V_cmd = V0;
 Kv = 0.0015;
 
 %% 记录
@@ -81,6 +81,16 @@ for k=1:N
     rn = norm(r); ur = r/rn;
     [lat, lon, h] = ecef2lla_wgs84(r');  
     Hhist(k)=h;
+
+    % 防止飞行器高度过低，终止仿真
+    if h <= 25e3
+        fprintf('Vehicle crashed into the ground at t=%.2f s\n', t(k));
+        Rhist = Rhist(1:k,:);
+        Vhist = Vhist(1:k,:);
+        Hhist = Hhist(1:k,:);
+        inf_time = k;
+        break;
+    end
 
     %% 大气相对速度
     v_air_eci = v - cross(omega_ie,r);
@@ -106,6 +116,10 @@ for k=1:N
     %% 大气、马赫、动压
     [a,rho] = atmos_simple(max(h,0));
     Ma = Vair/max(a,1e-3);
+    
+    % 气动数据查表保护，防止马赫数外推爆炸
+    Ma = max(min(Ma, 7.0), 0.0); % 假设最大支持马赫数为10.0，视情况调整
+    
     qbar = 0.5*rho*Vair^2;
 
     %% 重力
