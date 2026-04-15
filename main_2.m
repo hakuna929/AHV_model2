@@ -66,7 +66,7 @@ vT = [0;0;0];
 %% 控制参数
 Npn = 3.0;
 a_cmd_max = 30;             % m/s^2
-V_cmd = 2500;
+V_cmd = V0;
 Kv = 0.0015;
 
 %% 记录
@@ -152,16 +152,25 @@ for k=1:N
     phi_cmd   = max(min(phi_cmd,35*pi/180),-35*pi/180);
     psi_cmd   = chi_cmd;
 
-    %% ========== 3-DOF 姿态更新：假设理想姿态控制器（瞬间跟踪指令）==========
+       %% ========== 3-DOF 姿态更新：假设理想姿态控制器（瞬间跟踪指令）==========
     % 这里直接将期望姿态赋给当前姿态。如需考虑响应延迟，可以加入一阶低通滤波
-    % 例如：phi = phi + (phi_cmd - phi) * (dt / tau);
     phi = phi_cmd;
     theta = theta_cmd;
     psi = psi_cmd;
 
-    % 推力速度环
-    dT = dT + Kv*(V_cmd - Vair);
-    dT = max(min(dT,1.0),0.05);
+    % 【修改】推力速度环 (PI控制或带dt的积分控制)
+    err_v = V_cmd - Vair;
+    % Kv 这里如果是积分增益，必须乘上 dt
+    dT = dT + Kv * err_v * dt;  
+    
+    % 为了防止超速时推力降不下来，可以将下限适当放宽至0或者发动机允许的真实关断下限
+    dT = max(min(dT, 1.0), 0.0); 
+
+    %% 气动与推力 (不计算力矩，只需气动力)
+    % 添加超速时的强行阻力干预 (可选的飞行走廊保护)
+    if Vair > V_cmd + 100
+        % 可在此处增加减速板(或增大de2等舵面)来增加阻力
+    end
 
     %% 气动与推力 (不计算力矩，只需气动力)
     [CL,CD,CY,~,~,~] = aero_coeffs(Ma,alpha,beta,de1,de2,dr,dT); % 忽略力矩项
