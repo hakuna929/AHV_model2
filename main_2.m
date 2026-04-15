@@ -1,4 +1,5 @@
-clear; clc;
+clear;
+clc;
 
 %% 时间
 dt = 0.001;
@@ -84,7 +85,7 @@ for k=1:N
     Hhist(k)=h;
 
     % 防止飞行器高度过低，终止仿真
-    if h <= 25e3
+    if h <= 20e3
         fprintf('Vehicle crashed into the ground at t=%.2f s\n', t(k));
         Rhist = Rhist(1:k,:);
         Vhist = Vhist(1:k,:);
@@ -97,11 +98,27 @@ for k=1:N
     v_air_eci = v - cross(omega_ie,r);
     Vair = max(norm(v_air_eci),1e-3);
 
-    %% 姿态矩阵 (基于理想跟踪后的当前姿态角)
+    %% 姿态矩阵 
+    % 1. 先计算从 机体系(Body) 到 当地导航系(NED) 的旋转矩阵
+    % 这里的 phi, theta, psi 是相对于 NED 系的欧拉角
     cph=cos(phi); sph=sin(phi); cth=cos(theta); sth=sin(theta); cps=cos(psi); sps=sin(psi);
-    Ci_b = [cth*cps, sph*sth*cps-cph*sps, cph*sth*cps+sph*sps;
-            cth*sps, sph*sth*sps+cph*cps, cph*sth*sps-sph*cps;
-            -sth,    sph*cth,             cph*cth];
+    Cned_b = [cth*cps, sph*sth*cps-cph*sps, cph*sth*cps+sph*sps;
+              cth*sps, sph*sth*sps+cph*cps, cph*sth*sps-sph*cps;
+              -sth,    sph*cth,             cph*cth];
+          
+    % 2. 计算从 当地导航系(NED) 到 惯性系(ECI) 的旋转矩阵
+    % 根据当前位置的经纬度计算当地 NED 系在 ECI 系下的方向基向量
+    slat = sin(lat); clat = cos(lat);
+    slon = sin(lon); clon = cos(lon);
+    
+    eN_eci = [-slat*clon; -slat*slon; clat]; % 北向
+    eE_eci = [-slon;      clon;       0   ]; % 东向
+    eD_eci = [-clat*clon; -clat*slon; -slat]; % 地向 (Down, 指向地心)
+    
+    Ci_ned = [eN_eci, eE_eci, eD_eci]; % NED 到 ECI 的转换矩阵
+    
+    % 3. 得到最终的 机体 到 ECI 的转换矩阵
+    Ci_b = Ci_ned * Cned_b;
     Cb_i = Ci_b';
 
     %% 空速到机体系 (计算迎角侧滑角)
@@ -173,7 +190,7 @@ for k=1:N
     theta = theta_cmd;
     psi = psi_cmd;
 
-    % 【修改】推力速度环 (PI控制或带dt的积分控制)
+    % 推力速度环 (PI控制或带dt的积分控制)
     err_v = V_cmd - Vair;
     % Kv 这里如果是积分增益，必须乘上 dt
     dT = dT + Kv * err_v * dt;  
@@ -236,6 +253,6 @@ plot3(Rhist(1:inf_time,1)/1e3,Rhist(1:inf_time,2)/1e3,Rhist(1:inf_time,3)/1e3,'b
 xlabel('X_{ECI} (km)'); ylabel('Y_{ECI} (km)'); zlabel('Z_{ECI} (km)');
 title('Cruise Trajectory in ECI (3-DOF)');
 
-[xe,ye,ze]=sphere(60);
-surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
-legend('Vehicle Trajectory','Earth');
+% [xe,ye,ze]=sphere(60);
+% surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
+% legend('Vehicle Trajectory','Earth');
