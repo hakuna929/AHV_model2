@@ -180,18 +180,24 @@ for k=1:N
     a_h_eci = a_req_eci - a_vert_req * u_up;
     a_h = norm(a_h_eci);
 
-    % 4. 计算航向角指令 psi_cmd
-    if a_h > 1e-6
-        dir_h = a_h_eci / a_h;
-        chi_cmd = atan2(dot(dir_h, eE_now), dot(dir_h, eN_now));
+    % --- 修正后的航向角指令 (对齐速度矢量) ---
+    v_horz_vec = v_air_eci - dot(v_air_eci, u_up) * u_up;
+    if norm(v_horz_vec) > 1e-3
+        v_dir_h = v_horz_vec / norm(v_horz_vec);
+        chi_v = atan2(dot(v_dir_h, eE_now), dot(v_dir_h, eN_now));
     else
-        chi_cmd = psi;
+        chi_v = psi;
     end
-    psi_cmd = chi_cmd;
+    psi_cmd = chi_v;
 
-    % 5. 计算滚转角指令 phi_cmd (提供水平转弯过载)
-    % 飞机倾斜转弯：a_h / a_vert_req = tan(phi)
-    phi_cmd = atan2(a_h, max(a_vert_req, 0.1));
+    % --- 修正后的滚转角指令 (区分左右转弯) ---
+    % 定义机体水平面的右向矢量
+    right_dir = cos(chi_v)*eE_now - sin(chi_v)*eN_now;
+    % 计算需要向右侧提供的加速度分量
+    a_lat = dot(a_h_eci, right_dir);
+
+    % 飞机倾斜转弯：a_lat / a_vert_req = tan(phi)
+    phi_cmd = atan2(a_lat, max(a_vert_req, 0.1));
     phi_cmd = max(min(phi_cmd, 60*pi/180), -60*pi/180); % 限制最大滚转角为60度
 
        % 6. 计算升力需求并反推迎角
