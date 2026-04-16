@@ -86,9 +86,8 @@ for k=1:N
     [lat, lon, h] = ecef2lla_wgs84(r');  
     Hhist(k)=h;
 
-
     % 防止飞行器高度过低，终止仿真
-    if h <= 0
+    if h <= 20e3
         fprintf('Vehicle crashed into the ground at t=%.2f s\n', t(k));
         Rhist = Rhist(1:k,:);
         Vhist = Vhist(1:k,:);
@@ -104,14 +103,12 @@ for k=1:N
 
     %% 姿态矩阵 
     % 1. 先计算从 机体系(Body) 到 当地导航系(NED) 的旋转矩阵
-    % 这里的 phi, theta, psi 是相对于 NED 系的欧拉角
     cph=cos(phi); sph=sin(phi); cth=cos(theta); sth=sin(theta); cps=cos(psi); sps=sin(psi);
     Cned_b = [cth*cps, sph*sth*cps-cph*sps, cph*sth*cps+sph*sps;
               cth*sps, sph*sth*sps+cph*cps, cph*sth*sps-sph*cps;
               -sth,    sph*cth,             cph*cth];
           
     % 2. 计算从 当地导航系(NED) 到 惯性系(ECI) 的旋转矩阵
-    % 根据当前位置的经纬度计算当地 NED 系在 ECI 系下的方向基向量
     slat = sin(lat); clat = cos(lat);
     slon = sin(lon); clon = cos(lon);
     
@@ -132,19 +129,18 @@ for k=1:N
     beta  = asin(max(min(vv/Vair,1),-1));
 
     % 保护限幅
-    alpha = max(min(alpha, 10*pi/180), -2*pi/180);
+    alpha = max(min(alpha, 15*pi/180), -5*pi/180);
     beta  = max(min(beta,  6*pi/180), -6*pi/180);
 
     %% 大气、马赫、动压
     [a,rho] = atmos_simple(max(h,0));
     Ma = Vair/max(a,1e-3);
     
-    % 气动数据查表保护，防止马赫数外推爆炸
-    Ma = max(min(Ma, 7.0), 0.0); % 假设最大支持马赫数为10.0，视情况调整
+    % 气动数据查表保护
+    Ma = max(min(Ma, 7.0), 0.0); 
 
     % 动压：qbar
     qbar = 0.5*rho*Vair^2;
-
 
     %% 重力
     x=r(1); y=r(2); z=r(3); rr=max(norm(r),Re+1);
@@ -155,43 +151,94 @@ for k=1:N
     g_eci = g0 + gJ2;
     gmag = max(norm(g_eci),1e-3);
 
-    %% ========== 比例导引（PN） ==========
+    %% ========== 比例导引（PN）与 重力补偿 ==========
     r_rel = rT - r;
     R_dist = max(norm(r_rel),1);
     u_los = r_rel / R_dist;
     v_rel = vT - v;
     Vc = -dot(r_rel,v_rel)/R_dist;                         
     omega_los = cross(r_rel,v_rel)/(R_dist^2 + 1e-6);
-    a_cmd_eci = Npn * Vc * cross(omega_los, u_los);
+    
+    % 1. 计算比例导引所需机动加速度
+    a_pn_eci = Npn * Vc * cross(omega_los, u_los);
 
-    acn = norm(a_cmd_eci);
-    if acn > a_cmd_max
-        a_cmd_eci = a_cmd_eci/acn * a_cmd_max;
+    % 限幅 PN 机动加速度
+    if norm(a_pn_eci) > a_cmd_max
+        a_pn_eci = a_pn_eci/norm(a_pn_eci) * a_cmd_max;
     end
 
-    u_up = r/norm(r);
-    a_vert = dot(a_cmd_eci,u_up);
-    a_h_eci = a_cmd_eci - a_vert*u_up;
-    a_h = norm(a_h_eci);
+    % 2. 引入重补偿，计算期望的绝对总加速度指令
+    a_req_eci = a_pn_eci - g_eci; 
 
+    % 当地向上和水平面的基底
+    u_up = r/norm(r);
     eE_now = [-sin(lon); cos(lon); 0];
     eN_now = [-sin(lat)*cos(lon); -sin(lat)*sin(lon); cos(lat)];
 
+    % 3. 分解出垂直于当地地平面的加速度 (用以抗重力和爬升/俯冲) 和水平加速度
+    a_vert_req = dot(a_req_eci, u_up);
+    a_h_eci = a_req_eci - a_vert_req * u_up;
+    a_h = norm(a_h_eci);
+
+    % 4. 计算航向角指令 psi_cmd
     if a_h > 1e-6
-        dir_h = a_h_eci/a_h;
-        chi_cmd = atan2(dot(dir_h,eE_now), dot(dir_h,eN_now));
+        dir_h = a_h_eci / a_h;
+        chi_cmd = atan2(dot(dir_h, eE_now), dot(dir_h, eN_now));
     else
         chi_cmd = psi;
     end
+    psi_cmd = chi_cmd;
+
+    % 5. 计算滚转角指令 phi_cmd (提供水平转弯过载)
+    % 飞机倾斜转弯：a_h / a_vert_req = tan(phi)
+    phi_cmd = atan2(a_h, max(a_vert_req, 0.1));
+    phi_cmd = max(min(phi_cmd, 60*pi/180), -60*pi/180); % 限制最大滚转角为60度
+
+       % 6. 计算升力需求并反推迎角
+    % 总升力加速度 (假设全由升力提供)
+    a_L_req = sqrt(a_vert_req^2 + a_h^2);
+    L_req = m * a_L_req; 
+
+    % 计算期望的升力系数
+    CL_req = L_req / max(qbar * S_ref, 1);
     
+    % ==== 引入你的气动公式计算真实的 CL_alpha 和 CL0 ====
+    % 舵偏角转换为度
+    de1_deg = de1 * 180/pi; 
+    de2_deg = de2 * 180/pi;
+    
+    % 1. 计算零迎角(adeg=0)时的基础升力系数 CL0
+    CL0 = 0.1498 - 0.02751*Ma + 0.002343*Ma^2 + 0.006515*(de1_deg + de2_deg);
+    
+    % 2. 计算当前马赫数下的升力线斜率 (对 adeg 求导提取线性项，忽略微小的二次项)
+    % d(CL)/d(adeg) = 0.07235 - 0.003368*Ma
+    CL_alpha_per_deg = 0.07235 - 0.003368 * Ma;
+    
+    % 转换为每弧度(rad)的斜率 (因为代码里 alpha 是弧度)
+    CL_alpha_rad = CL_alpha_per_deg * (180 / pi); 
+    
+    % 保护机制：防止除以零或负斜率失控
+    if CL_alpha_rad < 0.1
+        CL_alpha_rad = 0.1; 
+    end
 
-    theta_cmd = atan2(a_vert,gmag);
-    theta_cmd = max(min(theta_cmd,10*pi/180),-10*pi/180);
-    phi_cmd   = atan2(a_h,gmag);
-    phi_cmd   = max(min(phi_cmd,35*pi/180),-35*pi/180);
-    psi_cmd   = chi_cmd;
+    % 3. 反推需要的迎角指令 (增量 = 需求 - 基础) / 斜率
+    alpha_cmd = (CL_req - CL0) / CL_alpha_rad; 
+    
+    % 限制迎角在合理范围 [-2度, 15度] 转换为弧度
+    alpha_cmd = max(min(alpha_cmd, 15*pi/180), -2*pi/180); 
 
-       %% ========== 3-DOF 姿态更新：假设理想姿态控制器（瞬间跟踪指令）==========
+    % 7. 计算当前航迹倾角 gamma，得到最终俯仰角指令 theta_cmd
+    v_vert = dot(v_air_eci, u_up);
+    v_horz = norm(v_air_eci - v_vert * u_up);
+    gamma_now = atan2(v_vert, v_horz);
+
+    % 俯仰角 = 航迹倾角 + 迎角在垂直剖面的投影
+    theta_cmd = gamma_now + alpha_cmd * cos(phi_cmd);
+    theta_cmd = max(min(theta_cmd, 30*pi/180), -30*pi/180);
+
+
+    %% ========== 3-DOF 姿态更新：假设理想姿态控制器（瞬间跟踪指令）==========
     % 这里直接将期望姿态赋给当前姿态。如需考虑响应延迟，可以加入一阶低通滤波
     phi = phi_cmd;
     theta = theta_cmd;
@@ -200,8 +247,6 @@ for k=1:N
     % 推力速度环 
     err_v = V_cmd - Vair;
     dT = dT + Kv * err_v * dt;  
-    
-    % 为了防止超速时推力降不下来，可以将下限适当放宽至0或者发动机允许的真实关断下限
     dT = max(min(dT, 1.0), 0.1); 
 
     %% 气动与推力 (不计算力矩，只需气动力)
@@ -261,9 +306,9 @@ plot3(Rhist(1:inf_time,1)/1e3,Rhist(1:inf_time,2)/1e3,Rhist(1:inf_time,3)/1e3,'b
 xlabel('X_{ECI} (km)'); ylabel('Y_{ECI} (km)'); zlabel('Z_{ECI} (km)');
 title('Cruise Trajectory in ECI (3-DOF)');
 
-% [xe,ye,ze]=sphere(60);
-% surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
-% legend('Vehicle Trajectory','Earth');
+[xe,ye,ze]=sphere(60);
+surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
+legend('Vehicle Trajectory','Earth');
 
 %% 实时相对距离变化曲线绘制
 figure;
