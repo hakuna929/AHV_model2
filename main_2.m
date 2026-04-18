@@ -20,7 +20,7 @@ S_ref = 0.2986;
 b_ref = 0.8;
 c_ref = 0.3732;
 
-%% 定速定高巡航初始条件（ECI）
+%% 定速定高巡航初始条件（ECEF）
 h0   = 30e3;        %高度
 lat0 = 19.2;        %纬度海南文昌
 lon0 = 110.5;       %经度海南文昌
@@ -37,20 +37,20 @@ eE = [-sind(lon0); cosd(lon0); 0];
 eN = [-sind(lat0)*cosd(lon0); -sind(lat0)*sind(lon0); cosd(lat0)];
 eU = [cosd(lat0)*cosd(lon0); cosd(lat0)*sind(lon0); sind(lat0)];
 v_rel0 = V0*(cosd(gamma0)*cosd(chi0)*eN + cosd(gamma0)*sind(chi0)*eE + sind(gamma0)*eU);
-v = v_rel0 + cross(omega_ie,r);
+v = v_rel0;   % ECEF速度 = 相对地球的速度
 
 % 姿态初始化
-v_air_eci_0 = v_rel0; 
-Vair_0 = norm(v_air_eci_0);
-xb = v_air_eci_0 / Vair_0;
+v_air_0 = v_rel0; 
+Vair_0 = norm(v_air_0);
+xb = v_air_0 / Vair_0;
 yb = cross(eU, xb);
 yb = yb / norm(yb);
 zb = cross(xb, yb);
 
-C_b2i_0 = [xb, yb, zb];
-theta = asin(-C_b2i_0(3,1));
-psi   = atan2(C_b2i_0(2,1), C_b2i_0(1,1));
-phi   = atan2(C_b2i_0(3,2), C_b2i_0(3,3));
+C_b2e_0 = [xb, yb, zb];
+theta = asin(-C_b2e_0(3,1));
+psi   = atan2(C_b2e_0(2,1), C_b2e_0(1,1));
+phi   = atan2(C_b2e_0(3,2), C_b2e_0(3,3));
 
 % 舵面默认值 (3自由度下忽略舵面对力的影响或设为0)
 de1=0; de2=0; dr=0; dT=1;
@@ -97,9 +97,9 @@ for k=1:N
         break;
     end
 
-    %% 大气相对速度
-    v_air_eci = v - cross(omega_ie,r);
-    Vair = max(norm(v_air_eci),1e-3);
+    %% 大气相对速度（ECEF速度即为相对大气速度）
+    v_air = v;
+    Vair = max(norm(v_air),1e-3);
 
     %% 姿态矩阵 
     % 1. 先计算从 机体系(Body) 到 当地导航系(NED) 的旋转矩阵
@@ -108,22 +108,23 @@ for k=1:N
               cth*sps, sph*sth*sps+cph*cps, cph*sth*sps-sph*cps;
               -sth,    sph*cth,             cph*cth];
           
-    % 2. 计算从 当地导航系(NED) 到 惯性系(ECI) 的旋转矩阵
+    % 2. 计算从 当地导航系(NED) 到 ECEF 的旋转矩阵
+    % 根据当前位置的经纬度计算当地 NED 系在 ECEF 系下的方向基向量
     slat = sin(lat); clat = cos(lat);
     slon = sin(lon); clon = cos(lon);
     
-    eN_eci = [-slat*clon; -slat*slon; clat]; % 北向
-    eE_eci = [-slon;      clon;       0   ]; % 东向
-    eD_eci = [-clat*clon; -clat*slon; -slat]; % 地向 (Down, 指向地心)
+    eN_e = [-slat*clon; -slat*slon; clat]; % 北向
+    eE_e = [-slon;      clon;       0   ]; % 东向
+    eD_e = [-clat*clon; -clat*slon; -slat]; % 地向 (Down, 指向地心)
     
-    Ci_ned = [eN_eci, eE_eci, eD_eci]; % NED 到 ECI 的转换矩阵
+    Ce_ned = [eN_e, eE_e, eD_e]; % NED 到 ECEF 的转换矩阵
     
-    % 3. 得到最终的 机体 到 ECI 的转换矩阵
-    Ci_b = Ci_ned * Cned_b;
-    Cb_i = Ci_b';
+    % 3. 得到最终的 机体 到 ECEF 的转换矩阵
+    Ce_b = Ce_ned * Cned_b;
+    Cb_e = Ce_b';
 
     %% 空速到机体系 (计算迎角侧滑角)
-    v_air_b = Cb_i * v_air_eci;
+    v_air_b = Cb_e * v_air;
     u=v_air_b(1); vv=v_air_b(2); w=v_air_b(3);
     alpha = atan2(w,u);
     beta  = asin(max(min(vv/Vair,1),-1));
@@ -142,14 +143,14 @@ for k=1:N
     % 动压：qbar
     qbar = 0.5*rho*Vair^2;
 
-    %% 重力
+    %% 重力（ECEF坐标系下的引力加速度）
     x=r(1); y=r(2); z=r(3); rr=max(norm(r),Re+1);
     g0 = -mu/rr^3*[x;y;z];
     gJ2 = [3*mu*J2*Re^2/(2*rr^5)*x*(1-5*(z/rr)^2);
            3*mu*J2*Re^2/(2*rr^5)*y*(1-5*(z/rr)^2);
            3*mu*J2*Re^2/(2*rr^5)*z*(3-5*(z/rr)^2)];
-    g_eci = g0 + gJ2;
-    gmag = max(norm(g_eci),1e-3);
+    g_ecef = g0 + gJ2;
+    gmag = max(norm(g_ecef),1e-3);
 
     %% ========== 比例导引（PN）与 重力补偿 ==========
     r_rel = rT - r;
@@ -160,15 +161,15 @@ for k=1:N
     omega_los = cross(r_rel,v_rel)/(R_dist^2 + 1e-6);
     
     % 1. 计算比例导引所需机动加速度
-    a_pn_eci = Npn * Vc * cross(omega_los, u_los);
+    a_pn_ecef = Npn * Vc * cross(omega_los, u_los);
 
     % 限幅 PN 机动加速度
-    if norm(a_pn_eci) > a_cmd_max
-        a_pn_eci = a_pn_eci/norm(a_pn_eci) * a_cmd_max;
+    if norm(a_pn_ecef) > a_cmd_max
+        a_pn_ecef = a_pn_ecef/norm(a_pn_ecef) * a_cmd_max;
     end
 
-    % 2. 引入重补偿，计算期望的绝对总加速度指令
-    a_req_eci = a_pn_eci - g_eci; 
+    % 2. 引入重力补偿并补偿科里奥利/向心加速度，计算期望气动加速度指令
+    a_req_ecef = a_pn_ecef - g_ecef + 2*cross(omega_ie, v) + cross(omega_ie, cross(omega_ie, r));
 
     % 当地向上和水平面的基底
     u_up = r/norm(r);
@@ -176,12 +177,12 @@ for k=1:N
     eN_now = [-sin(lat)*cos(lon); -sin(lat)*sin(lon); cos(lat)];
 
     % 3. 分解出垂直于当地地平面的加速度 (用以抗重力和爬升/俯冲) 和水平加速度
-    a_vert_req = dot(a_req_eci, u_up);
-    a_h_eci = a_req_eci - a_vert_req * u_up;
-    a_h = norm(a_h_eci);
+    a_vert_req = dot(a_req_ecef, u_up);
+    a_h_ecef = a_req_ecef - a_vert_req * u_up;
+    a_h = norm(a_h_ecef);
 
     % --- 修正后的航向角指令 (对齐速度矢量) ---
-    v_horz_vec = v_air_eci - dot(v_air_eci, u_up) * u_up;
+    v_horz_vec = v_air - dot(v_air, u_up) * u_up;
     if norm(v_horz_vec) > 1e-3
         v_dir_h = v_horz_vec / norm(v_horz_vec);
         chi_v = atan2(dot(v_dir_h, eE_now), dot(v_dir_h, eN_now));
@@ -194,7 +195,7 @@ for k=1:N
     % 定义机体水平面的右向矢量
     right_dir = cos(chi_v)*eE_now - sin(chi_v)*eN_now;
     % 计算需要向右侧提供的加速度分量
-    a_lat = dot(a_h_eci, right_dir);
+    a_lat = dot(a_h_ecef, right_dir);
 
     % 飞机倾斜转弯：a_lat / a_vert_req = tan(phi)
     phi_cmd = atan2(a_lat, max(a_vert_req, 0.1));
@@ -235,8 +236,8 @@ for k=1:N
     alpha_cmd = max(min(alpha_cmd, 15*pi/180), -2*pi/180); 
 
     % 7. 计算当前航迹倾角 gamma，得到最终俯仰角指令 theta_cmd
-    v_vert = dot(v_air_eci, u_up);
-    v_horz = norm(v_air_eci - v_vert * u_up);
+    v_vert = dot(v_air, u_up);
+    v_horz = norm(v_air - v_vert * u_up);
     gamma_now = atan2(v_vert, v_horz);
 
     % 俯仰角 = 航迹倾角 + 迎角在垂直剖面的投影
@@ -276,10 +277,11 @@ for k=1:N
     T_eng = CT*qbar*S_ref;
     Ft_b = [T_eng;0;0];
 
-    %% 平动方程 (3-DOF核心)
-    F_eci = Ci_b*(Fa_b + Ft_b);
-    a_eci = g_eci + F_eci/m;
-    v = v + a_eci*dt;
+    %% 平动方程 (3-DOF核心, ECEF坐标系)
+    F_ecef = Ce_b*(Fa_b + Ft_b);
+    % a_ecef = 引力 + 气动/推力/质量 - 科里奥利加速度 - 向心加速度
+    a_ecef = g_ecef + F_ecef/m - 2*cross(omega_ie, v) - cross(omega_ie, cross(omega_ie, r));
+    v = v + a_ecef*dt;
     r = r + v*dt;
 
     %% 记录
@@ -306,11 +308,11 @@ for k=1:N
     end
 end
 
-%% ECI轨迹
+%% ECEF轨迹
 figure;
 plot3(Rhist(1:inf_time,1)/1e3,Rhist(1:inf_time,2)/1e3,Rhist(1:inf_time,3)/1e3,'b','LineWidth',1.2); hold on; grid on; axis equal;
-xlabel('X_{ECI} (km)'); ylabel('Y_{ECI} (km)'); zlabel('Z_{ECI} (km)');
-title('Cruise Trajectory in ECI (3-DOF)');
+xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
+title('Cruise Trajectory in ECEF (3-DOF)');
 
 [xe,ye,ze]=sphere(60);
 surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
