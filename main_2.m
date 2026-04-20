@@ -98,7 +98,7 @@ for k=1:N
     Hhist(k)=h;
 
     % 防止飞行器高度过低，终止仿真
-    if h <= 20e3
+    if h <= 0
         fprintf('Vehicle crashed into the ground at t=%.2f s\n', t(k));
         Rhist = Rhist(1:k,:);
         Vhist = Vhist(1:k,:);
