@@ -8,10 +8,13 @@ t  = 0:dt:T;
 N  = numel(t);
 
 %% 地球常量
-% 地球wgs84椭球模型参数
+% 地球CGCS2000椭球模型
 mu  = 3.986004418e14;
 J2  = 1.08263e-3;
-Re  = 6378137;
+Re  = 6378137.0;            % 长半轴 a (m)
+f   = 1/298.257222101;      % 扁率
+e2  = 2*f - f^2;            % 第一偏心率平方
+Rp  = Re*(1-f);             % 短半轴 b (m)
 
 % 地球自转参数
 we  = 7.2921150e-5;
@@ -30,7 +33,7 @@ lat_T = 13.35;
 lon_T = 144.55;
 
 % 经纬高转换为 ECEF (此处将其视为瞬时惯性系下的固定目标点)
-rT = lla2ecef_wgs84(lat_T, lon_T, h_T);
+rT = lla2ecef_cgcs2000(lat_T, lon_T, h_T);
 rT = rT(:); % 确保是列向量 3x1
 vT = [0; 0; 0];
 
@@ -39,7 +42,7 @@ vT = [0; 0; 0];
 h0   = 30e3;        %高度
 lat0 = 19.2;        %纬度海南文昌
 lon0 = 110.5;       %经度海南文昌
-r = lla2ecef_wgs84(lat0, lon0, h0);
+r = lla2ecef_cgcs2000(lat0, lon0, h0);
 r0_ecef = r;
 
 Ma_r = 6.5; %期望巡航马赫数
@@ -90,7 +93,7 @@ inf_time = N;
 for k=1:N
     %% 地理量
     rn = norm(r); ur = r/rn;
-    [lat, lon, h] = ecef2lla_wgs84(r');  
+    [lat, lon, h] = ecef2lla_cgcs2000(r');  
     Hhist(k)=h;
 
     % 防止飞行器高度过低，终止仿真
@@ -206,7 +209,7 @@ for k=1:N
 
     % 飞机倾斜转弯：a_lat / a_vert_req = tan(phi)
     phi_cmd = atan2(a_lat, max(a_vert_req, 0.1));
-    phi_cmd = max(min(phi_cmd, 60*pi/180), -60*pi/180); % 限制最大滚转角为60度
+    phi_cmd = max(min(phi_cmd, 60*pi/180), -60*pi/180); % 限制最大滚转��为60度
 
        % 6. 计算升力需求并反推迎角
     % 总升力加速度 (假设全由升力提供)
@@ -321,9 +324,9 @@ plot3(Rhist(1:inf_time,1)/1e3,Rhist(1:inf_time,2)/1e3,Rhist(1:inf_time,3)/1e3,'b
 xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
 title('Cruise Trajectory in ECEF (3-DOF)');
 
-[xe,ye,ze]=sphere(60);
-surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
-legend('Vehicle Trajectory','Earth');
+% [xe,ye,ze]=sphere(60);
+% surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
+% legend('Vehicle Trajectory','Earth');
 
 %% 实时相对距离变化曲线绘制
 figure;
