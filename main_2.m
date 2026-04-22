@@ -2,19 +2,19 @@ clear;
 clc;
 
 %% 时间
-dt = 0.01;
+dt = 0.1;
 T  = 2000;
 t  = 0:dt:T;
-N  = numel(t);
+N  = length(t);
 
 %% 地球常量
 % 地球CGCS2000椭球模型
 mu  = 3.986004418e14;
 J2  = 1.08263e-3;
 Re  = 6378137.0;            % 长半轴 a (m)
-f   = 1/298.257222101;      % 扁率
-e2  = 2*f - f^2;            % 第一偏心率平方
-Rp  = Re*(1-f);             % 短半轴 b (m)（如后续需要）
+% f   = 1/298.257222101;      % 扁率
+% e2  = 2*f - f^2;            % 第一偏心率平方
+% Rp  = Re*(1-f);             % 短半轴 b (m)（如后续需要）
 
 
 % 地球自转参数
@@ -24,8 +24,8 @@ omega_ie = [0;0;we];
 %% 飞行器参数 
 m     = 671.33;
 S_ref = 0.2986;
-b_ref = 0.8;
-c_ref = 0.3732;
+% b_ref = 0.8;
+% c_ref = 0.3732;
 
 %% 目标点设置（经纬高转ECEF/ECI）
 h0   = 30e3;        %高度
@@ -33,7 +33,7 @@ h_T = h0;                   % 目标高度与飞行器初始高度一致
 lat_T = 13.35;
 lon_T = 144.55;
 
-% 经纬高转换为 ECEF (此处将其视为瞬时惯性系下的固定目标点)
+% 经纬高转换为 ECEF 
 rT = lla2ecef_cgcs2000(lat_T, lon_T, h_T);
 rT = rT(:); % 确保是列向量 3x1
 vT = [0; 0; 0];
@@ -50,9 +50,7 @@ Ma_r = 6.5; %期望巡航马赫数
 [a0,rh0_0] = atmos_simple(h0);
 V0 = Ma_r * a0;   %巡航速度
 
-eE = [-sind(lon0); cosd(lon0); 0];
-eN = [-sind(lat0)*cosd(lon0); -sind(lat0)*sind(lon0); cosd(lat0)];
-eU = [cosd(lat0)*cosd(lon0); cosd(lat0)*sind(lon0); sind(lat0)];
+
 
 % 计算起点到目标的大圆切线方向（ECEF下）
 r0_hat = r0_ecef / norm(r0_ecef);
@@ -62,6 +60,11 @@ v0_ecef = V0 * v_dir;
 v = v0_ecef;   % ECEF速度 = 相对地球的速度
 
 % 姿态初始化
+% ENU-->ECEF左边转换矩阵 R = [eE,eN,eU]
+eE = [-sind(lon0); cosd(lon0); 0];
+eN = [-sind(lat0)*cosd(lon0); -sind(lat0)*sind(lon0); cosd(lat0)];
+eU = [cosd(lat0)*cosd(lon0); cosd(lat0)*sind(lon0); sind(lat0)];
+
 v_air_0 = v0_ecef;
 Vair_0 = norm(v_air_0);
 xb = v_air_0 / Vair_0;
@@ -93,6 +96,9 @@ inf_time = N;
 
 for k=1:N
     %% 地理量
+    if k == 23736
+        a =1;
+    end
     rn = norm(r); ur = r/rn;
     [lat, lon, h] = ecef2lla_cgcs2000(r');  
     Hhist(k)=h;
@@ -149,13 +155,13 @@ for k=1:N
     Ma = Vair/max(a,1e-3);
     
     % 气动数据查表保护
-    Ma = max(min(Ma, 7.0), 0.0); 
+    Ma = max(min(Ma, 10.0), 0.0); 
 
     % 动压：qbar
     qbar = 0.5*rho*Vair^2;
 
     %% 重力（ECEF坐标系下的引力加速度）
-    x=r(1); y=r(2); z=r(3); rr=max(norm(r),Re+1);
+    x=r(1); y=r(2); z=r(3);
     g0 = -mu/rr^3*[x;y;z];
     gJ2 = [3*mu*J2*Re^2/(2*rr^5)*x*(1-5*(z/rr)^2);
            3*mu*J2*Re^2/(2*rr^5)*y*(1-5*(z/rr)^2);
@@ -269,9 +275,9 @@ for k=1:N
 
     %% 气动与推力 (不计算力矩，只需气动力)
     % 添加超速时的强行阻力干预 (可选的飞行走廊保护)
-    if Vair > V_cmd + 100
-        % 可在此处增加减速板(或增大de2等舵面)来增加阻力
-    end
+    % if Vair > V_cmd + 100
+    %     % 可在此处增加减速板(或增大de2等舵面)来增加阻力
+    % end
 
     %% 气动与推力 (不计算力矩，只需气动力)
     [CL,CD,CY,~,~,~] = aero_coeffs(Ma,alpha,beta,de1,de2,dr,dT); % 忽略力矩项
