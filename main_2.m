@@ -60,19 +60,37 @@ v0_ecef = V0 * v_dir;
 v = v0_ecef;   % ECEF速度 = 相对地球的速度
 
 % 姿态初始化
-% ENU-->ECEF左边转换矩阵 R = [eE,eN,eU]
-eE = [-sind(lon0); cosd(lon0); 0];
-eN = [-sind(lat0)*cosd(lon0); -sind(lat0)*sind(lon0); cosd(lat0)];
+% 当地Up（与地心相反方向）
 eU = [cosd(lat0)*cosd(lon0); cosd(lat0)*sind(lon0); sind(lat0)];
 
-v_air_0 = v0_ecef;
-Vair_0 = norm(v_air_0);
-xb = v_air_0 / Vair_0;
+% 当地东/北（ECEF）
+eE = [-sind(lon0); cosd(lon0); 0];
+eN = [-sind(lat0)*cosd(lon0); -sind(lat0)*sind(lon0); cosd(lat0)];
+
+% 目标相对方向
+r0_hat = r0_ecef / norm(r0_ecef);
+r_rel0 = rT - r0_ecef;
+
+% 取目标方向在当地水平面(切平面)的投影，作为机体x轴指向
+x_h = r_rel0 - (r_rel0' * r0_hat) * r0_hat;
+if norm(x_h) < 1e-6
+    % 退化：如果起点正对目标方向在径向上（极少），就用北向作为默认
+    xb = eN;
+else
+    xb = x_h / norm(x_h);
+end
+
+% 机体y轴：右侧方向（用Up叉乘得到右手系）
 yb = cross(eU, xb);
-yb = yb / norm(yb);
+yb = yb / max(norm(yb), 1e-6);
+
+% 机体z轴：保证正交右手系
 zb = cross(xb, yb);
+zb = zb / max(norm(zb), 1e-6);
 
 C_b2e_0 = [xb, yb, zb];
+
+% 由方向余弦矩阵反推欧拉角（沿用你原来的公式）
 theta = asin(-C_b2e_0(3,1));
 psi   = atan2(C_b2e_0(2,1), C_b2e_0(1,1));
 phi   = atan2(C_b2e_0(3,2), C_b2e_0(3,3));
@@ -90,6 +108,14 @@ Kv = 0.0015;
 Rhist = zeros(N,3);
 Vhist = zeros(N,3);
 Hhist = zeros(N,1);
+a_vert_req_hist = zeros(N,1);
+phi_cmd_hist = zeros(N,1);
+theta_cmd_hist = zeros(N,1);
+alpha_hist = zeros(N,1);
+alpha_cmd_hist = zeros(N,1);
+qbar_hist = zeros(N,1);
+CL_req_hist = zeros(N,1);
+CL_hist = zeros(N,1);
 Dist_hist = zeros(N,1); % 记录目标与飞行器的实时距离
 
 inf_time = N;
@@ -162,6 +188,7 @@ for k=1:N
 
     %% 重力（ECEF坐标系下的引力加速度）
     x=r(1); y=r(2); z=r(3);
+    rr = norm(r);
     g0 = -mu/rr^3*[x;y;z];
     gJ2 = [3*mu*J2*Re^2/(2*rr^5)*x*(1-5*(z/rr)^2);
            3*mu*J2*Re^2/(2*rr^5)*y*(1-5*(z/rr)^2);
@@ -195,6 +222,20 @@ for k=1:N
 
     % 3. 分解出垂直于当地地平面的加速度 (用以抗重力和爬升/俯冲) 和水平加速度
     a_vert_req = dot(a_req_ecef, u_up);
+
+    h_cmd = h0;                 % 30km 定高
+    dh    = h_cmd - h;          % 高度误差
+    vh    = dot(v_air, u_up);   % 向上速度(>0 上升)
+
+    Kph = 0.02;                 % 需要调参：单位约 m/s^2 per m
+    Kdh = 0.2;                  % 需要调参：单位约 m/s^2 per (m/s)
+
+    a_hold = Kph*dh - Kdh*vh;   % 误差大 -> 往上拉；上升太快 -> 压回
+
+    a_vert_req = a_vert_req + a_hold;
+
+    % 可加限幅，防止离谱
+    a_vert_req = max(min(a_vert_req, 20), -20);
     a_h_ecef = a_req_ecef - a_vert_req * u_up;
     a_h = norm(a_h_ecef);
 
@@ -305,6 +346,14 @@ for k=1:N
     Rhist(k,:)=r.';
     Vhist(k,:)=v.';
     Dist_hist(k) = norm(rT - r); % 新增：记录当前时刻的真实相对距离
+    a_vert_req_hist(k) = a_vert_req;
+    phi_cmd_hist(k) = phi_cmd;
+    theta_cmd_hist(k) = theta_cmd;
+    alpha_hist(k) = alpha;
+    alpha_cmd_hist(k) = alpha_cmd;
+    qbar_hist(k) = qbar;
+    CL_req_hist(k) = CL_req;
+    CL_hist(k) = CL;
 
     %% 命中判据
     if R_dist < 5e3
