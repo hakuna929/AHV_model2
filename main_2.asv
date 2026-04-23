@@ -3,7 +3,7 @@ clc;
 
 %% 时间
 dt = 0.1;
-T  = 2000;
+T  = 3000;
 t  = 0:dt:T;
 N  = length(t);
 
@@ -96,11 +96,11 @@ psi   = atan2(C_b2e_0(2,1), C_b2e_0(1,1));
 phi   = atan2(C_b2e_0(3,2), C_b2e_0(3,3));
 
 % 舵面默认值 (3自由度下忽略舵面对力的影响)
-de1=0; de2=0; dr=0; dT=1;
+de1=0.1; de2=0.1; dr=0.1; dT=0.5;
 
 %% 控制参数
 Npn = 3.0;
-a_cmd_max = 30;             % m/s^2
+a_cmd_max = 50;             % m/s^2
 V_cmd = V0;
 Kv = 0.0015;
 
@@ -108,7 +108,18 @@ Kv = 0.0015;
 Rhist = zeros(N,3);
 Vhist = zeros(N,3);
 Hhist = zeros(N,1);
+a_vert_cmd_hist = zeros(N,1);
+phi_cmd_hist = zeros(N,1);
+theta_cmd_hist = zeros(N,1);
+alpha_hist = zeros(N,1);
+alpha_cmd_hist = zeros(N,1);
+qbar_hist = zeros(N,1);
+CL_req_hist = zeros(N,1);
+CL_hist = zeros(N,1);
+a_h_cap_hist = zeros(N,1);
+dT_hist = zeros(N,1);
 
+a_L_cap_hist = zeros(N,1);
 Dist_hist = zeros(N,1); % 记录目标与飞行器的实时距离
 
 inf_time = N;
@@ -123,7 +134,7 @@ for k=1:N
     Hhist(k)=h;
 
     % 防止飞行器高度过低，终止仿真
-    if h <= 0
+    if h <= 2e
         fprintf('Vehicle crashed into the ground at t=%.2f s\n', t(k));
         Rhist = Rhist(1:k,:);
         Vhist = Vhist(1:k,:);
@@ -166,8 +177,8 @@ for k=1:N
     beta  = asin(max(min(vv/Vair,1),-1));
 
     % 保护限幅
-    alpha = max(min(alpha, 15*pi/180), -5*pi/180);
-    beta  = max(min(beta,  6*pi/180), -6*pi/180);
+    alpha = max(min(alpha, 5*pi/180), -5*pi/180);
+    beta  = max(min(beta,  3*pi/180), -3*pi/180);
 
     %% 大气、马赫、动压
     [a,rho] = atmos_simple(max(h,0));
@@ -196,7 +207,17 @@ for k=1:N
     v_rel = vT - v;
     Vc = -dot(r_rel,v_rel)/R_dist;                         
     omega_los = cross(r_rel,v_rel)/(R_dist^2 + 1e-6);
-    
+
+   % ===== 末段降低PN增益，避免横向需求过大导致长期CL饱和 =====
+   if R_dist < 300e3          % 300 km 内进入末制导（阈值可调）
+       Npn_use = 1.2;
+   elseif R_dist < 600e3
+       Npn_use = 1.8;
+   else
+       Npn_use = Npn;         % 远段用原始3.0
+   end
+
+
     % 1. 计算比例导引所需机动加速度
     a_pn_ecef = Npn * Vc * cross(omega_los, u_los);
 
@@ -210,51 +231,151 @@ for k=1:N
 
     % 当地向上和水平面的基底
     u_up = r/norm(r);
+    a_pn_h = a_pn_ecef - dot(a_pn_ecef, u_up)*u_up;
     eE_now = [-sin(lon); cos(lon); 0];
     eN_now = [-sin(lat)*cos(lon); -sin(lat)*sin(lon); cos(lat)];
 
     % 3. 分解出垂直于当地地平面的加速度 (用以抗重力和爬升/俯冲) 和水平加速度
-    a_vert_req = dot(a_req_ecef, u_up);
+    % a_vert_cmd = dot(a_req_ecef, u_up);
 
-    h_cmd = h0;                 % 30km 定高
-    dh    = h_cmd - h;          % 高度误差
-    vh    = dot(v_air, u_up);   % 向上速度(>0 上升)
+    % h_cmd = h0;                 % 30km 定高
+    % dh    = h_cmd - h;          % 高度误差
+    % vh    = dot(v_air, u_up);   % 向上速度(>0 上升)
+    % 
+    % Kph = 0.001;                 % 需要调参：单位约 m/s^2 per m
+    % Kdh = 0.05;                  % 需要调参：单位约 m/s^2 per (m/s)
+    % 
+    % a_hold = Kph*dh - Kdh*vh;   % 误差大 -> 往上拉；上升太快 -> 压回
+    % 
+    % a_vert_cmd = a_vert_cmd + a_hold;
+    % 
+    % % 可加限幅，防止离谱
+    % % a_vert_cmd = max(min(a_vert_cmd, 30), -20);
+    % a_h_ecef = a_req_ecef - a_vert_cmd * u_up;
+    % % a_h = norm(a_h_ecef);
+    % 
+    % % ================== 控制分配：基于可达升力限制指令（避免CL_req超包线） ==================
+    % % 观测到实际CL_max约为2.5，若仍按 a_L_req = sqrt(a_vert^2 + a_h^2) 反推，
+    % % 会出现 CL_req>>CL 而导致持续掉高/穿地。因此在这里对"总法向加速度需求"做可达性分配：
+    % % 1) 垂直优先（保高）
+    % % 2) 水平使用剩余能力（牺牲末制导机动以换取不掉高）
+    % 
+    % CL_max = 2.5;  % 可按 aero_coeffs 的能力再调整/做成函数
+    % 
+    % % 当前动压下的"可达最大法向加速度"（假设法向主要由升力提供）
+    % a_L_cap = (CL_max * qbar * S_ref) / m;     % m/s^2
+    % 
+    % % 不要让垂直指令超过气动可达能力（否则一定把水平饿死）
+    % a_vert_cmd = max(min(a_vert_cmd, 0.9*a_L_cap), -0.9*a_L_cap);
+    % 
+    % 
+    % % 1) 垂��优先：先把垂直需求限在可达范围内
+    % a_vert_cmd = max(min(a_vert_cmd,  a_L_cap), -a_L_cap);
+    % 
+    % % 2) 水平用剩余：保证 sqrt(a_vert^2 + a_h^2) <= a_L_cap
+    % a_h_cap = sqrt(max(a_L_cap^2 - a_vert_cmd^2, 0));
 
-    Kph = 0.02;                 % 需要调参：单位约 m/s^2 per m
-    Kdh = 0.2;                  % 需要调参：单位约 m/s^2 per (m/s)
 
-    a_hold = Kph*dh - Kdh*vh;   % 误差大 -> 往上拉；上升太快 -> 压回
 
-    a_vert_req = a_vert_req + a_hold;
+    % --- 纯几何分解（不要掺入控制器改过的a_vert_cmd）---
+    a_vert_geo = dot(a_req_ecef, u_up);
+    a_h_geo    = a_req_ecef - a_vert_geo * u_up;   % 这才是真正的水平分量
+    a_h        = norm(a_h_geo);
 
-    % 可加限幅，防止离谱
-    a_vert_req = max(min(a_vert_req, 20), -20);
-    a_h_ecef = a_req_ecef - a_vert_req * u_up;
-    a_h = norm(a_h_ecef);
+    % --- 定高外环：生成"垂直加速度修正量"---
+    h_cmd = h0;
+    dh = h_cmd - h;
+    vh = dot(v_air, u_up);
+
+    Kph = 0.001;   % 先用小一点
+    Kdh = 0.05;
+
+    a_hold = Kph*dh - Kdh*vh;
+
+    % --- 最终垂直指令：在几何垂直基础上叠加保持项 ---
+    a_vert_cmd = a_vert_geo + a_hold;
+
+    % --- 能力分配：留余量给水平机动 ---
+    CL_max = 2.5;
+    a_L_cap = (CL_max * qbar * S_ref) / m;
+
+    vert_share = 0.75;
+    a_vert_cmd = max(min(a_vert_cmd,  vert_share*a_L_cap), -vert_share*a_L_cap);
+
+    a_h_cap = sqrt(max(a_L_cap^2 - a_vert_cmd^2, 0));
+    if a_h > a_h_cap && a_h > 1e-6
+        a_h_geo = a_h_geo * (a_h_cap / a_h);
+    end
+
+    % --- 用"缩放后的水平分量 + 指令垂直分量"重构最终需求 ---
+    a_req_alloc = a_h_geo + a_vert_cmd * u_up;
+
+
+    a_h = norm(a_h_geo);
+    if a_h > a_h_cap && a_h > 1e-6
+        a_h_geo = a_h_geo * (a_h_cap / a_h);
+    end
+    a_h = norm(a_h_geo);   % 更新水平加速度需求幅值
+    % ================================================================================
 
     % --- 修正后的航向角指令 (对齐速度矢量) ---
-    v_horz_vec = v_air - dot(v_air, u_up) * u_up;
-    if norm(v_horz_vec) > 1e-3
-        v_dir_h = v_horz_vec / norm(v_horz_vec);
-        chi_v = atan2(dot(v_dir_h, eE_now), dot(v_dir_h, eN_now));
+    v_horz_vec = v_air - dot(v_air, u_up)*u_up;
+    if norm(v_horz_vec) > 1e-6
+        fwd_dir = v_horz_vec / norm(v_horz_vec);
     else
-        chi_v = psi;
+        fwd_dir = eN_now;
+    end
+    right_dir = cross(u_up, fwd_dir);
+    right_dir = right_dir / max(norm(right_dir), 1e-6);
+
+    v_horz_vec = v_air - dot(v_air, u_up) * u_up;
+    if norm(v_horz_vec) > 1e-6
+        v_dir_h = v_horz_vec / norm(v_horz_vec);
+        chi_v = atan2(dot(v_dir_h, eE_now), dot(v_dir_h, eN_now));  % chi=atan2(E,N)
+    else
+        chi_v = psi;  % 退化：保持当前psi
     end
     psi_cmd = chi_v;
 
-    % --- 修正后的滚转角指令 (区分左右转弯) ---
-    % 定义机体水平面的右向矢量
-    right_dir = cos(chi_v)*eE_now - sin(chi_v)*eN_now;
-    % 计算需要向右侧提供的加速度分量
-    a_lat = dot(a_h_ecef, right_dir);
+    a_lat = dot(a_pn_h, right_dir);
 
-    % 飞机倾斜转弯：a_lat / a_vert_req = tan(phi)
-    phi_cmd = atan2(a_lat, max(a_vert_req, 0.1));
+    % 这里用"有效垂直支撑"做分母（至少取一个g的量级更合理）
+    phi_cmd = atan2(a_lat, max(a_vert_cmd, 1.0));
+    phi_cmd = max(min(phi_cmd, 60*pi/180), -60*pi/180);
+
+    % --- 修正后的滚转角指令 (区分左右转弯) ---
+   
+    % % 定义机体水平面的右向矢量
+    % right_dir = cos(chi_v)*eE_now - sin(chi_v)*eN_now;
+    % % 计算需要向右侧提供的加速度分量
+    % a_lat = dot(a_h_ecef, right_dir);
+    % 
+    % % 飞机倾斜转弯：a_lat / a_vert_cmd = tan(phi)
+    % phi_cmd = atan2(a_lat, max(a_vert_cmd, 0.1));
+
+    % ===== 用速度水平投影定义右向，避免chi_v/right_dir符号问题 =====
+    v_h = v_air - dot(v_air, u_up)*u_up;     % 水平速度分量
+    if norm(v_h) > 1e-6
+        v_h_hat = v_h / norm(v_h);
+    else
+        v_h_hat = eN_now;                   % 退化处理
+    end
+
+    % "右向" = Up × 前向（右手系）
+    right_dir = cross(u_up, v_h_hat);
+    right_dir = right_dir / max(norm(right_dir), 1e-6);
+
+    % 水平加速度在右向上的分量
+    a_lat = dot(a_h_geo, right_dir);
+
+    phi_cmd = atan2(a_lat, max(a_vert_cmd, 0.1));
+    phi_cmd = max(min(phi_cmd, 60*pi/180), -60*pi/180);
+
     phi_cmd = max(min(phi_cmd, 60*pi/180), -60*pi/180); % 限制最大滚转��为60度
 
        % 6. 计算升力需求并反推迎角
     % 总升力加速度 (假设全由升力提供)
-    a_L_req = sqrt(a_vert_req^2 + a_h^2);
+    a_L_req = sqrt(a_vert_cmd^2 + a_h^2);
     L_req = m * a_L_req; 
 
     % 计算期望的升力系数
@@ -330,6 +451,17 @@ for k=1:N
 
     %% 平动方程 (3-DOF核心, ECEF坐标系)
     F_ecef = Ce_b*(Fa_b + Ft_b);
+    if k == 1950
+        a =1;
+    end
+
+    a_aero_ecef = (Ce_b*Fa_b)/m;
+    a_up_aero   = dot(a_aero_ecef, u_up);   % >0 代表气动力在"向上抬"
+
+    % disp(a_up_aero);
+    % disp(clat);
+    % disp(alpha);
+
     % a_ecef = 引力 + 气动/推力/质量 - 科里奥利加速度 - 向心加速度
     a_ecef = g_ecef + F_ecef/m - 2*cross(omega_ie, v) - cross(omega_ie, cross(omega_ie, r));
     v = v + a_ecef*dt;
@@ -339,12 +471,17 @@ for k=1:N
     Rhist(k,:)=r.';
     Vhist(k,:)=v.';
     Dist_hist(k) = norm(rT - r); % 新增：记录当前时刻的真实相对距离
-    a_vert_req_hist(k) = a_vert_req;
+    a_vert_cmd_hist(k) = a_vert_cmd;
     phi_cmd_hist(k) = phi_cmd;
     theta_cmd_hist(k) = theta_cmd;
     alpha_hist(k) = alpha;
     alpha_cmd_hist(k) = alpha_cmd;
     qbar_hist(k) = qbar;
+    CL_req_hist(k) = CL_req;
+    CL_hist(k) = CL;
+    a_h_cap_hist(k) = a_h_cap;
+    a_L_cap_hist(k) = a_L_cap;
+    dT_hist(k) = dT;
 
     %% 命中判据
     if R_dist < 5e3
@@ -371,9 +508,9 @@ plot3(Rhist(1:inf_time,1)/1e3,Rhist(1:inf_time,2)/1e3,Rhist(1:inf_time,3)/1e3,'b
 xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
 title('Cruise Trajectory in ECEF (3-DOF)');
 
-% [xe,ye,ze]=sphere(60);
-% surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
-% legend('Vehicle Trajectory','Earth');
+[xe,ye,ze]=sphere(60);
+surf(Re*xe/1e3,Re*ye/1e3,Re*ze/1e3,'FaceAlpha',0.08,'EdgeColor','none','FaceColor',[0.2 0.6 1.0]);
+legend('Vehicle Trajectory','Earth');
 
 %% 实时相对距离变化曲线绘制
 figure;
