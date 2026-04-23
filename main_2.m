@@ -309,6 +309,20 @@ for k=1:N
     theta = theta_cmd;
     psi = psi_cmd;
 
+    % 使用新指令姿态角立即重新计算旋转矩阵和气动角，消除单步延迟
+    cph=cos(phi); sph=sin(phi); cth=cos(theta); sth=sin(theta); cps=cos(psi); sps=sin(psi);
+    Cned_b = [cth*cps, sph*sth*cps-cph*sps, cph*sth*cps+sph*sps;
+              cth*sps, sph*sth*sps+cph*cps, cph*sth*sps-sph*cps;
+              -sth,    sph*cth,             cph*cth];
+    Ci_b = Ci_ned * Cned_b;
+    Cb_i = Ci_b';
+    v_air_b = Cb_i * v_air_eci;
+    u=v_air_b(1); vv=v_air_b(2); w=v_air_b(3);
+    alpha = atan2(w,u);
+    beta  = asin(max(min(vv/Vair,1),-1));
+    alpha = max(min(alpha, 15*pi/180), -5*pi/180);
+    beta  = max(min(beta,  6*pi/180), -6*pi/180);
+
     % 推力速度环 
     err_v = V_cmd - Vair;
     dT = dT + Kv * err_v * dt;  
