@@ -1,0 +1,448 @@
+% main_3dof_L1_HV_PID.m
+% 3DOF主程序：横向L1航线跟踪 + 纵向高度PID + 速度CT前馈+PI
+% 说明：
+% - 采用ECEF平动积分
+% - A/B/C调试思路：气动力在ECEF直接构造，CY默认置0，简化重力可开关
+% - 需要你已有函数：
+%   lla2ecef_cgcs2000, ecef2lla_cgcs2000, atmos_simple, aero_coeffs, thrust_coeffs, wrapToPi
+
+clear; clc;
+
+%% ===================== 时间 =====================
+dt = 0.001;
+T  = 3000;
+t  = 0:dt:T;
+N  = numel(t);
+
+%% ===================== 地球常量 =====================
+mu  = 3.986004418e14;
+Re  = 6378137.0;
+we  = 7.2921150e-5;
+omega_ie = [0;0;we];
+
+% 物理开关
+use_simple_gravity = true;   % true: 仅两体引力
+use_rotation_terms = false;  % true: 加地转项
+
+%% ===================== 飞行器参数 =====================
+m     = 671.33;
+S_ref = 0.2986;
+
+%% ===================== 初始与目标 =====================
+h_init = 30e3;
+lat0 = 19.2; lon0 = 110.5;
+r = lla2ecef_cgcs2000(lat0, lon0, h_init); r = r(:);
+
+Ma_init = 6.5;
+[a0,~] = atmos_simple(h_init);
+V0 = Ma_init * a0;
+
+% 初始速度：沿首航段方向给
+% 终端目标（最后一个航点）
+latT = 13.35; lonT = 144.55; hT = 30e3;
+rT = lla2ecef_cgcs2000(latT, lonT, hT); rT = rT(:);
+
+%% ===================== 航线（航点） =====================
+% 你可自行增删航点。建议第一版先直达两点。
+wps_lla = [
+    lat0, lon0, h_init;
+    latT, lonT, hT
+];
+
+nWP = size(wps_lla,1);
+wps_ecef = zeros(nWP,3);
+for i = 1:nWP
+    wps_ecef(i,:) = lla2ecef_cgcs2000(wps_lla(i,1), wps_lla(i,2), wps_lla(i,3));
+end
+
+wp_idx = 2;                          % 当前目标航点索引（从2开始）
+r_wp_prev = wps_ecef(1,:)';          % 当前航段起点
+r_wp_next = wps_ecef(2,:)';          % 当前航段终点
+wp_switch_dist = 30e3;               % 航点切换阈值(m)
+
+% 初始速度方向（沿航段水平投影）
+u_up0 = r/norm(r);
+t0 = r_wp_next - r_wp_prev;
+t0_h = t0 - dot(t0,u_up0)*u_up0;
+if norm(t0_h) < 1e-6, t0_h = t0; end
+v = V0 * t0_h / max(norm(t0_h),1e-6);
+
+%% ===================== 姿态状态（用于alpha/beta估算） =====================
+% 3DOF里姿态可视作"理想内环跟踪"
+phi = 0; theta = 0; psi = 0;
+
+%% ===================== 控制参数 =====================
+% 横向L1
+L1_base = 100e3;          % 基础前视距离
+L1_gainV = 25;            % L1随速度调度: L1 = max(L1_base, L1_gainV*Vh)
+a_lat_max = 60;           % m/s^2
+
+% 航向跟踪（把L1产生的横向加速度映射到滚转）
+phi_lim   = 60*pi/180;
+theta_lim = 30*pi/180;
+alpha_min = -2*pi/180;
+alpha_max = 15*pi/180;
+
+% 高度PID -> 垂向加速度
+Kph = 0.010;
+Kih = 0.00002;
+Kdh = 0.08;
+a_h_max = 25;
+int_h = 0;
+int_h_lim = 8e4;
+
+% 速度控制：CT前馈 + PI
+Kpv = 0.0018;
+Kiv = 0.00025;
+int_v = 0;
+int_v_lim = 8e3;
+
+CT_min = 0.00;
+CT_max = 0.40;
+dT_min = 0.10;
+dT_max = 1.00;
+tau_dT = 0.6;
+dT = 0.6;
+
+% 速度指令（马赫指令）
+M_cmd_far = 6.2;
+M_cmd_mid = 5.0;
+M_cmd_near= 4.0;
+V_floor = 700;
+
+% 舵面（3DOF简化：固定）
+de1 = 0; de2 = 0; dr = 0;
+
+%% ===================== 记录 =====================
+Rhist = nan(N,3); Vhist = nan(N,3);
+Hhist = nan(N,1); Dist_hist = nan(N,1); Vc_hist = nan(N,1);
+Vmag_hist = nan(N,1); Vcmd_hist = nan(N,1); Mcmd_hist = nan(N,1);
+dT_hist = nan(N,1); CTff_hist = nan(N,1); CTcmd_hist = nan(N,1);
+CL_hist = nan(N,1); CD_hist = nan(N,1); CY_hist = nan(N,1);
+alpha_hist = nan(N,1); beta_hist = nan(N,1);
+a_up_total_hist = nan(N,1);
+wp_idx_hist = nan(N,1);
+
+stop_k = N; stop_reason = "completed";
+
+%% ===================== 主循环 =====================
+for k = 1:N
+    % 地理量
+    [lat, lon, h] = ecef2lla_cgcs2000(r');
+    Hhist(k) = h;
+
+    if h <= 8e3
+        stop_k = k; stop_reason = "terrain impact";
+        fprintf('Vehicle impacted terrain at t=%.1f s\n', t(k));
+        break;
+    end
+
+    % 目标相对（用于监控）
+    r_rel_T = rT - r;
+    R_to_T = norm(r_rel_T);
+    u_los_T = r_rel_T / max(R_to_T,1);
+    Vc = dot(v, u_los_T);             % toward-target speed component
+
+    % 大气
+    v_air = v;
+    V = max(norm(v_air),1e-3);
+    [a_snd, rho] = atmos_simple(max(h,0));
+    Ma = max(min(V/max(a_snd,1e-3), 8.0), 0.0);
+    qbar = 0.5*rho*V^2;
+
+    % 局部基底
+    u_up = r / norm(r);
+    eE = [-sin(lon); cos(lon); 0];
+    eN = [-sin(lat)*cos(lon); -sin(lat)*sin(lon); cos(lat)];
+
+    v_h = v_air - dot(v_air,u_up)*u_up;
+    Vh = max(norm(v_h),1e-6);
+    u_vh = v_h / Vh;
+
+    %% ---------- 航点切换 ----------
+    r_to_wp = r_wp_next - r;
+    dist_to_wp = norm(r_to_wp);
+    if dist_to_wp < wp_switch_dist && wp_idx < nWP
+        wp_idx = wp_idx + 1;
+        r_wp_prev = r_wp_next;
+        r_wp_next = wps_ecef(wp_idx,:)';
+    end
+    wp_idx_hist(k) = wp_idx;
+
+    %% =====================================================
+    %% 1) 横向：L1航线跟踪
+    %% =====================================================
+    t_hat = r_wp_next - r_wp_prev;
+    t_hat = t_hat / max(norm(t_hat),1e-6);
+    t_h = t_hat - dot(t_hat,u_up)*u_up;
+    t_h = t_h / max(norm(t_h),1e-6);
+
+    r_from_start = r - r_wp_prev;
+    r_xt = r_from_start - dot(r_from_start,t_h)*t_h;
+    xt = norm(r_xt);
+
+    if xt > 1e-6
+        n_xt = r_xt/xt;   % 从航线指向飞机
+    else
+        n_xt = cross(u_up,t_h); n_xt = n_xt/max(norm(n_xt),1e-6);
+    end
+
+    L1_dist = max(L1_base, L1_gainV*Vh);
+    r_L1 = r + L1_dist*t_h - min(xt,0.5*L1_dist)*n_xt;
+    u_L1 = r_L1 - r;
+    u_L1 = u_L1 - dot(u_L1,u_up)*u_up;
+    u_L1 = u_L1 / max(norm(u_L1),1e-6);
+
+    sin_eta = dot(cross(u_vh,u_L1),u_up);
+    cos_eta = dot(u_vh,u_L1);
+    eta = atan2(sin_eta,cos_eta);
+
+    a_lat_cmd = 2*Vh^2/max(L1_dist,1)*sin(eta);
+    a_lat_cmd = max(min(a_lat_cmd, a_lat_max), -a_lat_max);
+
+    right_h = cross(u_up,u_vh); right_h = right_h/max(norm(right_h),1e-6);
+    a_lat_vec = a_lat_cmd * right_h;
+
+    %% =====================================================
+    %% 2) 纵向：高度PID
+    %% =====================================================
+    % 高度指令：这里取当前航段终点高度
+    [~,~,h_wp_next] = ecef2lla_cgcs2000(r_wp_next');
+    h_cmd = h_wp_next;
+
+    h_err = h_cmd - h;
+    v_up = dot(v_air,u_up);    % 上升率(上正)
+
+    int_h = int_h + h_err*dt;
+    int_h = max(min(int_h,int_h_lim),-int_h_lim);
+
+    a_h_cmd = Kph*h_err + Kih*int_h - Kdh*v_up;
+    a_h_cmd = max(min(a_h_cmd,a_h_max),-a_h_max);
+
+    a_vert_vec = a_h_cmd * u_up;
+
+    % 合成几何加速度指令
+    a_cmd_ecef = a_lat_vec + a_vert_vec;
+    a_cmd_norm = norm(a_cmd_ecef);
+
+    %% =====================================================
+    %% 3) 加速度命令 -> alpha/phi（简化映射）
+    %% =====================================================
+    % 升力能力
+    CL_max = 2.5;
+    aL_cap = (CL_max*qbar*S_ref)/m;
+
+    if a_cmd_norm > aL_cap && a_cmd_norm > 1e-6
+        a_cmd_ecef = a_cmd_ecef * (aL_cap/a_cmd_norm);
+        a_cmd_norm = aL_cap;
+    end
+
+    % 分解到"垂向/侧向"
+    a_vert_req = dot(a_cmd_ecef,u_up);
+    a_h_req_vec = a_cmd_ecef - a_vert_req*u_up;
+    a_lat_req = dot(a_h_req_vec,right_h);
+
+    % 滚转命令（由侧向/垂向需求比）
+    phi_cmd = atan2(a_lat_req, max(abs(a_vert_req),1.0));
+    phi_cmd = max(min(phi_cmd,phi_lim),-phi_lim);
+
+    % CL需求 -> alpha_cmd（简化）
+    CL_req = (m*a_cmd_norm)/max(qbar*S_ref,1);
+
+    % 用近似线性斜率反推alpha（与你气动模型兼容）
+    adeg_est = 2.0;
+    CL_alpha_rad = (0.07235 - 0.003368*Ma) * (180/pi); % from your model
+    CL_alpha_rad = max(CL_alpha_rad,0.1);
+    CL0_est = 0.1498 - 0.02751*Ma + 0.002343*Ma^2 + 0.001185*adeg_est^2;
+
+    alpha_cmd = (CL_req - CL0_est)/CL_alpha_rad;
+    alpha_cmd = max(min(alpha_cmd,alpha_max),alpha_min);
+
+    % 俯仰命令（保持与速度矢量一致 + alpha）
+    gamma_now = atan2(v_up, Vh);
+    theta_cmd = gamma_now + alpha_cmd*cos(phi_cmd);
+    theta_cmd = max(min(theta_cmd,theta_lim),-theta_lim);
+
+    % 航向由水平速度方向给（3DOF简化）
+    chi_v = atan2(dot(u_vh,eE), dot(u_vh,eN));
+    psi_cmd = chi_v;
+
+    % 理想姿态跟踪
+    phi = phi_cmd; theta = theta_cmd; psi = psi_cmd;
+
+    %% =====================================================
+    %% 4) 速度保持：马赫指令 -> CT前馈 + PI -> 油门
+    %% =====================================================
+    if R_to_T > 900e3
+        M_cmd = M_cmd_far;
+    elseif R_to_T > 300e3
+        M_cmd = M_cmd_mid;
+    else
+        M_cmd = M_cmd_near;
+    end
+    Mcmd_hist(k) = M_cmd;
+
+    V_cmd = max(M_cmd*a_snd, V_floor);
+    Vcmd_hist(k) = V_cmd;
+
+    % 气动系数（3DOF一致版建议：舵偏固定）
+    [CL,CD,CY,~,~,~] = aero_coeffs(Ma, alpha_cmd, 0, de1, de2, dr, dT);
+    CY = 0;  % B: 先关侧力，提升稳定性
+
+    L = CL*qbar*S_ref;
+    D = CD*qbar*S_ref;
+
+    % CT前馈（维持速度）
+    CT_ff = D / max(qbar*S_ref,1);
+
+    % PI修正
+    v_err = V_cmd - V;
+    int_v = int_v + v_err*dt;
+    int_v = max(min(int_v,int_v_lim),-int_v_lim);
+
+    CT_cmd = CT_ff + Kpv*v_err + Kiv*int_v;
+    CT_cmd = max(min(CT_cmd,CT_max),CT_min);
+
+    % anti-windup
+    if (CT_cmd >= CT_max-1e-6 && v_err>0) || (CT_cmd <= CT_min+1e-6 && v_err<0)
+        int_v = int_v - 0.7*v_err*dt;
+    end
+
+    % 由CT反解dT（网格）
+    dT_grid = linspace(dT_min,dT_max,41);
+    CT_grid = zeros(size(dT_grid));
+    for ii = 1:numel(dT_grid)
+        CT_grid(ii) = thrust_coeffs(Ma, alpha_cmd, 0, dT_grid(ii));
+    end
+    [~,ix] = min(abs(CT_grid - CT_cmd));
+    dT_target = dT_grid(ix);
+
+    dT = dT + (dT_target - dT)*dt/tau_dT;
+    dT = max(min(dT,dT_max),dT_min);
+
+    % 实际推力
+    CT = thrust_coeffs(Ma, alpha_cmd, 0, dT);
+    T_eng = CT*qbar*S_ref;
+
+    %% =====================================================
+    %% 5) 力构造（A）并积分
+    %% =====================================================
+    % 前向取水平速度方向（巡航）
+    if norm(v_h) > 1e-6
+        fwd = v_h / norm(v_h);
+    else
+        fwd = v_air / max(norm(v_air),1e-6);
+    end
+
+    F_drag_e   = -D * (v_air/max(norm(v_air),1e-6));
+    F_lift_e   =  L * u_up;
+    F_thrust_e =  T_eng * fwd;
+
+    F_ecef = F_drag_e + F_lift_e + F_thrust_e;
+
+    % 重力
+    if use_simple_gravity
+        g_ecef = -mu/norm(r)^3 * r;
+    else
+        g_ecef = -mu/norm(r)^3 * r;  % 如需J2可扩展
+    end
+
+    if use_rotation_terms
+        a_ecef = g_ecef + F_ecef/m - 2*cross(omega_ie,v) - cross(omega_ie,cross(omega_ie,r));
+    else
+        a_ecef = g_ecef + F_ecef/m;
+    end
+
+    v = v + a_ecef*dt;
+    r = r + v*dt;
+
+    %% ---------- 记录 ----------
+    Rhist(k,:) = r.';
+    Vhist(k,:) = v.';
+    Dist_hist(k)= R_to_T;
+    Vc_hist(k) = Vc;
+    Vmag_hist(k)= V;
+    dT_hist(k) = dT;
+    CTff_hist(k)= CT_ff;
+    CTcmd_hist(k)= CT_cmd;
+    CL_hist(k)=CL; CD_hist(k)=CD; CY_hist(k)=CY;
+    alpha_hist(k)=alpha_cmd;
+    beta_hist(k)=0;
+    a_up_total_hist(k)=dot(F_ecef/m + g_ecef, u_up);
+
+    % 命中判据
+    if R_to_T < 10e3
+        stop_k = k; stop_reason = "target reached";
+        fprintf('Target reached at t=%.1f s, miss=%.1f m\n', t(k), R_to_T);
+        break;
+    end
+
+    if any(~isfinite([r;v;Ma;qbar;CL;CD;CT;dT]))
+        stop_k = k; stop_reason = "NaN/Inf";
+        fprintf('NaN/Inf at step %d, t=%.1f s\n', k, t(k));
+        break;
+    end
+end
+
+%% ===================== 后处理 =====================
+valid = isfinite(Dist_hist) & Dist_hist>0;
+tt = t(valid);
+
+fprintf('Simulation stop reason: %s, t=%.1f s\n', stop_reason, t(stop_k));
+
+%% ===================== 绘图 =====================
+figure;
+plot(tt, Dist_hist(valid)/1000, 'm', 'LineWidth',1.6); grid on;
+xlabel('Time (s)'); ylabel('Distance to Target (km)');
+title('Distance to Target');
+
+figure;
+plot(tt, Vc_hist(valid), 'b', 'LineWidth',1.4); grid on; yline(0,'r--');
+xlabel('Time (s)'); ylabel('V_c (m/s)');
+title('Closing Speed');
+
+figure;
+plot(tt, Vmag_hist(valid), 'k', 'LineWidth',1.4); hold on; grid on;
+plot(tt, Vcmd_hist(valid), 'r--', 'LineWidth',1.2);
+xlabel('Time (s)'); ylabel('Speed (m/s)');
+title('Speed Tracking');
+legend('|V|','V_{cmd}','Location','best');
+
+figure;
+plot(tt, Hhist(valid)/1000, 'LineWidth',1.4); grid on;
+xlabel('Time (s)'); ylabel('Altitude (km)');
+title('Altitude');
+
+figure;
+plot(tt, dT_hist(valid), 'LineWidth',1.3); grid on;
+xlabel('Time (s)'); ylabel('dT');
+title('Throttle');
+
+figure;
+plot(tt, CTff_hist(valid), 'b--', 'LineWidth',1.2); hold on; grid on;
+plot(tt, CTcmd_hist(valid), 'r-', 'LineWidth',1.2);
+xlabel('Time (s)'); ylabel('C_T');
+title('CT Feedforward / CT Command');
+legend('CT_{ff}','CT_{cmd}','Location','best');
+
+figure;
+plot(tt, CL_hist(valid), 'b', 'LineWidth',1.2); hold on; grid on;
+plot(tt, CD_hist(valid), 'r--', 'LineWidth',1.2);
+xlabel('Time (s)'); ylabel('Coefficient');
+title('Aerodynamic Coefficients');
+legend('C_L','C_D','Location','best');
+
+figure;
+plot(tt, a_up_total_hist(valid), 'm', 'LineWidth',1.3); hold on; grid on;
+yline(0,'k--');
+xlabel('Time (s)'); ylabel('a_{up,total} (m/s^2)');
+title('Up-axis Total Acceleration');
+
+figure;
+plot3(Rhist(valid,1)/1e3, Rhist(valid,2)/1e3, Rhist(valid,3)/1e3, 'b','LineWidth',1.3); hold on; grid on; axis equal;
+[xe,ye,ze] = sphere(60);
+surf(Re*xe/1e3, Re*ye/1e3, Re*ze/1e3, 'FaceAlpha',0.08,'EdgeColor','none');
+plot3(rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'ro','MarkerFaceColor','r');
+xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
+title('Trajectory in ECEF');
+legend('Vehicle','Earth','Target','Location','best');

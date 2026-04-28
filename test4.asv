@@ -1,0 +1,706 @@
+% main_3dof_4ship_V_to_target.m
+% 4机3DOF：V字编队朝目标飞行（尖端对准目标）
+% 依赖函数：
+% lla2ecef_cgcs2000, ecef2lla_cgcs2000, atmos_simple, aero_coeffs, thrust_coeffs
+
+clear; clc;
+
+%% ===================== 时间 =====================
+dt_base = 0.1;
+T_end   = 3500;
+N_max   = ceil(T_end/dt_base)*6;   % 给自适应步长留裕度
+
+%% ===================== 常量 =====================
+mu  = 3.986004418e14;
+Re  = 6378137.0;
+we  = 7.2921150e-5;
+omega_ie = [0;0;we];
+
+use_simple_gravity = true;
+use_rotation_terms = false;
+
+%% ===================== 飞行器参数 =====================
+nVeh  = 4;
+m     = 671.33 * ones(1,nVeh);
+S_ref = 0.2986 * ones(1,nVeh);
+
+%% ===================== 初始/目标 =====================
+h0 = 30e3; lat0 = 19.2; lon0 = 110.5;
+r0 = lla2ecef_cgcs2000(lat0, lon0, h0); r0 = r0(:);
+
+latT = 13.35; lonT = 144.55; hT = 30e3;
+rT = lla2ecef_cgcs2000(latT, lonT, hT); rT = rT(:);
+
+[a0,~] = atmos_simple(h0);
+V0 = 6.5 * a0;
+
+% 局部基（初始，用于布阵）
+u_up0 = r0 / norm(r0);
+ex0 = rT - r0; ex0 = ex0 - dot(ex0,u_up0)*u_up0; ex0 = ex0 / max(norm(ex0),1e-6); % 朝目标水平前向
+ey0 = cross(u_up0, ex0); ey0 = ey0 / max(norm(ey0),1e-6);
+ez0 = u_up0;
+
+% V字编队偏移（在领机局部 ex-ey-ez）
+% 1号领机：尖端；2左后；3右后；4中后
+d_back0 = 5000;    % m
+d_side0 = 8000;    % m
+offV = [...
+    0,          0,       0;
+   -d_back0,   -d_side0, 0;
+   -d_back0,    d_side0, 0;
+   -2*d_back0,  0,       0];
+
+% 状态初始化
+r = zeros(3,nVeh);
+v = zeros(3,nVeh);
+for i = 1:nVeh
+    r(:,i) = r0 + offV(i,1)*ex0 + offV(i,2)*ey0 + offV(i,3)*ez0;
+end
+for i = 1:nVeh
+    v(:,i) = V0 * ex0;   % 初始同向同速
+end
+
+% 姿态（仅记录/估算）
+phi = zeros(1,nVeh);
+theta = zeros(1,nVeh);
+psi = zeros(1,nVeh);
+
+% 油门
+dT = 0.55 * ones(1,nVeh);
+
+%% ===================== 控制参数 =====================
+% L1横向
+L1_base  = 100e3;
+L1_gainV = 25;
+a_lat_max_cruise = 60;
+a_lat_max_term   = 140;
+
+% 纵向高度PID
+Kph = 0.010 * ones(1,nVeh);
+Kih = 0.00002 * ones(1,nVeh);
+Kdh = 0.08 * ones(1,nVeh);
+int_h = zeros(1,nVeh);
+int_h_lim = 8e4;
+a_h_max = 25;
+
+% 姿态/迎角限幅（简化映射）
+phi_lim   = 65*pi/180;
+theta_lim = 35*pi/180;
+alpha_min = -2*pi/180;
+alpha_max = 10*pi/180;
+
+% 速度控制（CT前馈+PI）
+Kpv = 0.0018 * ones(1,nVeh);
+Kiv = 0.00025 * ones(1,nVeh);
+int_v = zeros(1,nVeh);
+int_v_lim = 8e3;
+
+CT_min = 0.00; CT_max = 0.35;
+dT_min = 0.10; dT_max = 0.25;
+tau_dT = 0.6;
+
+% 马赫指令（统一）
+M_cmd_far  = 6.5;
+M_cmd_mid  = 6.5;
+M_cmd_near = 6.5;
+V_floor    = 1800;
+
+% 终端参数
+R_hit_leader   = 1000;    % 领机命中阈值
+R_term1        = 120e3;
+R_term2        = 40e3;
+R_pass_check   = 20e3;
+
+% 编队收拢（越近目标，编队越紧）
+R_form_tight = 120e3;   % 开始收拢
+R_form_min   = 20e3;    % 收拢到最小
+tight_ratio_min = 0.35; % 最小收拢比例
+
+%% ===================== 记录 =====================
+t_log = nan(N_max,1);
+
+DistL_hist = nan(N_max,1);      % 领机到目标
+DistAll_hist = nan(N_max,nVeh); % 各机到目标
+Vmag_hist = nan(N_max,nVeh);
+Vcmd_hist = nan(N_max,nVeh);
+dT_hist   = nan(N_max,nVeh);
+CL_hist   = nan(N_max,nVeh);
+CD_hist   = nan(N_max,nVeh);
+CTcmd_hist= nan(N_max,nVeh);
+L1_hist   = nan(N_max,nVeh);
+
+Rhist = nan(N_max,3,nVeh);
+
+minRangeLeader = inf;
+stop_reason = "completed";
+k = 1;
+t_now = 0;
+
+%% ===================== 主循环 =====================
+while k <= N_max && t_now <= T_end
+    % 领机当前几何
+    rL = r(:,1);
+    vL = v(:,1);
+
+    r_rel_L = rT - rL;
+    R_L = norm(r_rel_L);
+    u_los_L = r_rel_L / max(R_L,1);
+    Vc_L = dot(vL, u_los_L);
+    minRangeLeader = min(minRangeLeader, R_L);
+
+    % 终止判据（领机）
+    if R_L <= R_hit_leader
+        stop_reason = "leader target reached";
+        fprintf('Leader reached target at t=%.2f s, miss=%.1f m\n', t_now, R_L);
+        break;
+    end
+    if (R_L < R_pass_check) && (Vc_L <= 0)
+        stop_reason = "leader passed closest approach";
+        fprintf('Leader passed closest approach at t=%.2f s, min=%.1f m\n', t_now, minRangeLeader);
+        break;
+    end
+
+    % 自适应步长（按领机）
+    if R_L < R_term2
+        dt_use = 0.01;
+    elseif R_L < R_term1
+        dt_use = 0.02;
+    else
+        dt_use = dt_base;
+    end
+
+    % ---------- 构造"尖端朝目标"的编队参考 ----------
+    [latL, lonL, hL] = ecef2lla_cgcs2000(rL');
+    u_upL = rL / norm(rL);
+
+    ex = rT - rL;                          % 指向目标
+    ex = ex - dot(ex,u_upL)*u_upL;         % 水平化，避免垂向抖动
+    if norm(ex) < 1e-6
+        ex = vL - dot(vL,u_upL)*u_upL;
+    end
+    ex = ex / max(norm(ex),1e-6);
+
+    ey = cross(u_upL, ex); ey = ey / max(norm(ey),1e-6);
+    ez = u_upL;
+
+    % 编队收拢比例
+    if R_L >= R_form_tight
+        ratio = 1.0;
+    elseif R_L <= R_form_min
+        ratio = tight_ratio_min;
+    else
+        ratio = tight_ratio_min + (1-tight_ratio_min)*(R_L-R_form_min)/(R_form_tight-R_form_min);
+    end
+    off_now = offV * ratio;
+
+    % 各机虚拟目标点（1号直打目标，2/3/4跟编队点）
+    rGuid = zeros(3,nVeh);
+    rGuid(:,1) = rT;
+    for i = 2:nVeh
+        rGuid(:,i) = rL + off_now(i,1)*ex + off_now(i,2)*ey + off_now(i,3)*ez;
+    end
+
+    % ---------- 逐机更新 ----------
+    for i = 1:nVeh
+        ri = r(:,i);
+        vi = v(:,i);
+        mi = m(i);
+        Si = S_ref(i);
+
+        % 地理量
+        [lat, lon, h] = ecef2lla_cgcs2000(ri');
+        if h <= 20e3
+            stop_reason = sprintf('vehicle %d terrain impact', i);
+            fprintf('Vehicle %d impacted terrain at t=%.2f s\n', i, t_now);
+            break;
+        end
+
+        % 大气
+        V = max(norm(vi),1e-3);
+        [a_snd, rho] = atmos_simple(max(h,0));
+        Ma = max(min(V/max(a_snd,1e-3),8.0),0.0);
+        qbar = 0.5*rho*V^2;
+
+        u_up = ri / norm(ri);
+        eE = [-sin(lon); cos(lon); 0];
+        eN = [-sin(lat)*cos(lon); -sin(lat)*sin(lon); cos(lat)];
+
+        vh = vi - dot(vi,u_up)*u_up;
+        Vh = max(norm(vh),1e-6);
+        u_vh = vh / Vh;
+        right_h = cross(u_up,u_vh); right_h = right_h / max(norm(right_h),1e-6);
+
+        % ========== 横向导引（对各自引导点） ==========
+        r_rel = rGuid(:,i) - ri;
+        Rg = norm(r_rel);
+        u_los = r_rel / max(Rg,1);
+
+        % 近似L1：直接对引导点做前视
+        if R_L < R_term2
+            L1_dist = max(8e3, 8*Vh);
+            a_lat_max = a_lat_max_term;
+        elseif R_L < R_term1
+            L1_dist = max(20e3, 12*Vh);
+            a_lat_max = 0.8*a_lat_max_term;
+        else
+            L1_dist = max(L1_base, L1_gainV*Vh);
+            a_lat_max = a_lat_max_cruise;
+        end
+
+        u_L1 = u_los - dot(u_los,u_up)*u_up;
+        if norm(u_L1) < 1e-8, u_L1 = u_vh; end
+        u_L1 = u_L1 / max(norm(u_L1),1e-6);
+
+        sin_eta = dot(cross(u_vh,u_L1),u_up);
+        cos_eta = dot(u_vh,u_L1);
+        eta = atan2(sin_eta,cos_eta);
+
+        a_lat_cmd = 2*Vh^2/max(L1_dist,1) * sin(eta);
+        a_lat_cmd = min(max(a_lat_cmd,-a_lat_max),a_lat_max);
+        a_lat_vec = a_lat_cmd * right_h;
+
+        % ========== 纵向高度控制 ==========
+        if i == 1
+            h_cmd = hT;    % 领机盯目标高度
+        else
+            [~,~,hGi] = ecef2lla_cgcs2000(rGuid(:,i)');
+            h_cmd = hGi;
+        end
+
+        v_up = dot(vi,u_up);
+        h_err = h_cmd - h;
+
+        int_h(i) = int_h(i) + h_err*dt_use;
+        int_h(i) = min(max(int_h(i),-int_h_lim),int_h_lim);
+
+        a_h_cmd = Kph(i)*h_err + Kih(i)*int_h(i) - Kdh(i)*v_up;
+        a_h_cmd = min(max(a_h_cmd,-a_h_max),a_h_max);
+
+        a_vert_vec = a_h_cmd * u_up;
+        a_cmd = a_lat_vec + a_vert_vec;
+        a_cmd_norm = norm(a_cmd);
+
+        % ========== a_cmd -> alpha / phi（简化映射） ==========
+        CL_max = 2.8;
+        aL_cap = (CL_max*qbar*Si)/mi;
+        if a_cmd_norm > aL_cap && a_cmd_norm > 1e-6
+            a_cmd = a_cmd * (aL_cap/a_cmd_norm);
+            a_cmd_norm = aL_cap;
+        end
+
+        a_vert_req = dot(a_cmd,u_up);
+        a_h_req = a_cmd - a_vert_req*u_up;
+        a_lat_req = dot(a_h_req,right_h);
+
+        phi_cmd = atan2(a_lat_req, max(abs(a_vert_req),1.0));
+        phi_cmd = min(max(phi_cmd,-phi_lim),phi_lim);
+
+        CL_req = (mi*a_cmd_norm)/max(qbar*Si,1);
+        adeg_est = 2.0;
+        CL_alpha_rad = (0.07235 - 0.003368*Ma) * (180/pi);
+        CL_alpha_rad = max(CL_alpha_rad,0.1);
+        CL0_est = 0.1498 - 0.02751*Ma + 0.002343*Ma^2 + 0.001185*adeg_est^2;
+
+        alpha_cmd = (CL_req - CL0_est)/CL_alpha_rad;
+        alpha_cmd = min(max(alpha_cmd,alpha_min),alpha_max);
+
+        theta_cmd = atan2(v_up,Vh) + alpha_cmd*cos(phi_cmd);
+        theta_cmd = min(max(theta_cmd,-theta_lim),theta_lim);
+
+        chi_v = atan2(dot(u_vh,eE), dot(u_vh,eN));
+        psi_cmd = chi_v;
+
+        phi(i) = phi_cmd; theta(i) = theta_cmd; psi(i) = psi_cmd;
+
+        % ========== 速度控制 ==========
+        if R_L > 900e3
+            M_cmd = M_cmd_far;
+        elseif R_L > 250e3
+            M_cmd = M_cmd_mid;
+        else
+            M_cmd = M_cmd_near;
+        end
+        V_cmd = max(M_cmd*a_snd, V_floor);
+
+        [CL,CD,CY,~,~,~] = aero_coeffs(Ma, alpha_cmd, 0, 0, 0, 0, dT(i));
+        CY = 0; 
+        L = CL*qbar*Si;
+        D = CD*qbar*Si;
+
+        CT_ff = D / max(qbar*Si,1);
+        v_err = V_cmd - V;
+
+        int_v(i) = int_v(i) + v_err*dt_use;
+        int_v(i) = min(max(int_v(i),-int_v_lim),int_v_lim);
+
+        CT_cmd = CT_ff + Kpv(i)*v_err + Kiv(i)*int_v(i);
+        CT_cmd = min(max(CT_cmd,CT_min),CT_max);
+
+        if (CT_cmd>=CT_max-1e-6 && v_err>0) || (CT_cmd<=CT_min+1e-6 && v_err<0)
+            int_v(i) = int_v(i) - 0.7*v_err*dt_use;
+        end
+
+        % CT反解dT
+        dT_grid = linspace(dT_min,dT_max,41);
+        CT_grid = zeros(size(dT_grid));
+        for jj=1:numel(dT_grid)
+            CT_grid(jj) = thrust_coeffs(Ma, alpha_cmd, 0, dT_grid(jj));
+        end
+        [~,ix] = min(abs(CT_grid - CT_cmd));
+        dT_target = dT_grid(ix);
+
+        dT(i) = dT(i) + (dT_target - dT(i))*dt_use/tau_dT;
+        dT(i) = min(max(dT(i),dT_min),dT_max);
+
+        CT = thrust_coeffs(Ma, alpha_cmd, 0, dT(i));
+        T_eng = CT*qbar*Si;
+
+        % ========== 力与积分 ==========
+        if norm(vh) > 1e-6
+            fwd = vh / norm(vh);
+        else
+            fwd = vi / max(norm(vi),1e-6);
+        end
+
+        F_drag   = -D * (vi/max(norm(vi),1e-6));
+        F_lift   =  L * u_up;
+        F_thrust =  T_eng * fwd;
+        F_ecef   = F_drag + F_lift + F_thrust;
+
+        if use_simple_gravity
+            g_ecef = -mu/norm(ri)^3 * ri;
+        end
+
+        if use_rotation_terms
+            a_ecef = g_ecef + F_ecef/mi - 2*cross(omega_ie,vi) - cross(omega_ie,cross(omega_ie,ri));
+        else
+            a_ecef = g_ecef + F_ecef/mi;
+        end
+
+        vi = vi + a_ecef*dt_use;
+        ri = ri + vi*dt_use;
+
+        % 写回
+        r(:,i) = ri;
+        v(:,i) = vi;
+
+        % 记录单机
+        DistAll_hist(k,i) = norm(rT - ri);
+        Vmag_hist(k,i) = V;
+        Vcmd_hist(k,i) = V_cmd;
+        dT_hist(k,i) = dT(i);
+        CL_hist(k,i) = CL;
+        CD_hist(k,i) = CD;
+        CTcmd_hist(k,i) = CT_cmd;
+        L1_hist(k,i) = L1_dist;
+
+        Rhist(k,:,i) = ri.';
+    end 
+
+    if contains(stop_reason,'terrain impact')
+        break;
+    end
+
+    DistL_hist(k) = R_L;
+    t_now = t_now + dt_use;
+    t_log(k) = t_now;
+
+    if any(~isfinite(r(:))) || any(~isfinite(v(:)))
+        stop_reason = "NaN/Inf";
+        fprintf('NaN/Inf at t=%.2f s\n', t_now);
+        break;
+    end
+
+    k = k + 1;
+end
+
+% ===================== 后处理 =====================
+valid = isfinite(t_log) & isfinite(DistL_hist);
+tt = t_log(valid);
+
+fprintf('Stop reason: %s, t=%.2f s, leader min range=%.1f m\n', ...
+    stop_reason, tt(end), min(DistL_hist(valid)));
+
+%% ===================== 绘图1 =====================
+figure;
+plot(tt, DistL_hist(valid)/1000, 'm', 'LineWidth',1.8); grid on;
+xlabel('Time (s)'); ylabel('Leader Distance to Target (km)');
+title('Leader Distance to Target');
+
+figure; hold on; grid on;
+cols = lines(nVeh);
+for i=1:nVeh
+    plot(tt, DistAll_hist(valid,i)/1000, 'Color', cols(i,:), 'LineWidth',1.4);
+end
+xlabel('Time (s)'); ylabel('Distance to Target (km)');
+title('All Vehicles Distance to Target');
+legend('Veh1(Leader)','Veh2','Veh3','Veh4','Location','best');
+
+figure; hold on; grid on;
+for i=1:nVeh
+    plot(tt, Vmag_hist(valid,i), 'Color', cols(i,:), 'LineWidth',1.2);
+end
+xlabel('Time (s)'); ylabel('Speed (m/s)');
+title('Speed of 4 Vehicles');
+legend('Veh1','Veh2','Veh3','Veh4','Location','best');
+
+figure; hold on; grid on;
+for i=1:nVeh
+    plot(tt, dT_hist(valid,i), 'Color', cols(i,:), 'LineWidth',1.2);
+end
+xlabel('Time (s)'); ylabel('dT');
+title('Throttle Commands');
+legend('Veh1','Veh2','Veh3','Veh4','Location','best');
+
+% 3D轨迹
+figure; hold on; grid on; axis equal;
+[xe,ye,ze] = sphere(60);
+surf(Re*xe/1e3, Re*ye/1e3, Re*ze/1e3, 'FaceAlpha',0.08,'EdgeColor','none');
+
+for i=1:nVeh
+    Ri = squeeze(Rhist(valid,:,i));
+    plot3(Ri(:,1)/1e3, Ri(:,2)/1e3, Ri(:,3)/1e3, 'LineWidth',1.4, 'Color', cols(i,:));
+end
+plot3(rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'rp','MarkerFaceColor','r','MarkerSize',10);
+
+xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
+title('4-Ship V Formation Trajectories (Tip toward Target)');
+legend('Earth','Veh1','Veh2','Veh3','Veh4','Target','Location','best');
+
+%% 绘图2 
+% 输入假设：
+% Rhist: [N x 3 x nVeh]
+% valid: [N x 1] 逻辑索引
+% rT   : [3 x 1] 目标ECEF
+% Re   : 地球半径
+
+figure('Name','All Vehicles 3D Trajectories');
+hold on; grid on; axis equal;
+
+% 地球
+[xe,ye,ze] = sphere(80);
+surf(Re*xe/1e3, Re*ye/1e3, Re*ze/1e3, ...
+    'FaceAlpha',0.08, 'EdgeColor','none', 'FaceColor',[0.2 0.6 1.0]);
+
+% 颜色
+nVeh = size(Rhist,3);
+cols = lines(nVeh);
+
+% 每架飞行器轨迹
+for i = 1:nVeh
+    Ri = squeeze(Rhist(valid,:,i));   % [Nv x 3]
+    plot3(Ri(:,1)/1e3, Ri(:,2)/1e3, Ri(:,3)/1e3, ...
+        'LineWidth',1.8, 'Color', cols(i,:));
+    
+    % 起点/终点标记
+    plot3(Ri(1,1)/1e3, Ri(1,2)/1e3, Ri(1,3)/1e3, 'o', ...
+        'Color', cols(i,:), 'MarkerFaceColor', cols(i,:), 'MarkerSize', 5);
+    plot3(Ri(end,1)/1e3, Ri(end,2)/1e3, Ri(end,3)/1e3, 's', ...
+        'Color', cols(i,:), 'MarkerFaceColor', cols(i,:), 'MarkerSize', 6);
+end
+
+% 目标点
+plot3(rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'rp', ...
+    'MarkerFaceColor','r', 'MarkerSize',12);
+
+xlabel('X_{ECEF} (km)');
+ylabel('Y_{ECEF} (km)');
+zlabel('Z_{ECEF} (km)');
+title('3D Trajectories of All Vehicles');
+
+% 图例
+lgd = cell(1,nVeh+1);
+for i = 1:nVeh
+    lgd{i} = sprintf('Vehicle %d', i);
+end
+lgd{end} = 'Target';
+legend(lgd, 'Location','bestoutside');
+
+view(35,25);
+
+
+%% 绘图3
+% 增强版3D可视化：
+% 1) 所有飞行器完整轨迹
+% 2) 起点/终点标记
+% 3) 按时间抽样绘制V字连线
+% 4) 颜色随时间渐变（可选）
+% 5) 目标点、地球球体、末段放大视图（可选）
+
+% ====== 需要的输入变量 ======
+% Rhist : [N x 3 x nVeh] ECEF(m)
+% valid : [N x 1] logical
+% t_log : [N x 1] 时间(s)（可选，没有就用样本序号）
+% rT    : [3 x 1] 目标ECEF(m)
+% Re    : 地球半径(m)
+
+% ---------- 检查 ----------
+assert(exist('Rhist','var')==1, '缺少 Rhist');
+assert(exist('valid','var')==1, '缺少 valid');
+assert(exist('rT','var')==1, '缺少 rT');
+assert(exist('Re','var')==1, '缺少 Re');
+
+R = Rhist(valid,:,:);              % [Nv x 3 x nVeh]
+Nv = size(R,1);
+nVeh = size(R,3);
+
+if exist('t_log','var')~=1 || isempty(t_log)
+    tt = (1:Nv)';
+else
+    tt = t_log(valid);
+end
+
+if nVeh < 4
+    warning('当前nVeh=%d，V字连线按前4架处理会自动降级。', nVeh);
+end
+
+% ---------- 参数 ----------
+showTimeGradient = true;   % 轨迹颜色是否随时间渐变
+showEarth        = true;
+showTerminalZoom = true;
+
+vLineEvery = max(1, floor(Nv/40));  % V字连线抽样间隔（越小越密）
+vLineWidth = 1.2;
+trajWidth  = 1.8;
+
+% V字连接顺序（默认4机：2-1-3，且1-4）
+% 若不足4机会自动适配
+idxLeader = 1;
+idxLeft   = min(2,nVeh);
+idxRight  = min(3,nVeh);
+idxTail   = min(4,nVeh);
+
+cols = lines(max(nVeh,4));
+
+% ---------- 主图 ----------
+fig = figure('Name','Enhanced 3D Formation Visualization','Color','w');
+ax = axes(fig); hold(ax,'on'); grid(ax,'on'); axis(ax,'equal');
+
+% 地球
+if showEarth
+    [xe,ye,ze] = sphere(100);
+    surf(ax, Re*xe/1e3, Re*ye/1e3, Re*ze/1e3, ...
+        'FaceAlpha',0.08, 'EdgeColor','none', 'FaceColor',[0.2 0.6 1.0]);
+end
+
+% 画每架轨迹
+for i = 1:nVeh
+    Ri = squeeze(R(:,:,i))/1e3;  % km
+
+    if showTimeGradient
+        % 用surface实现渐变色线
+        x = Ri(:,1)'; y = Ri(:,2)'; z = Ri(:,3)';
+        c = linspace(0,1,numel(x));
+        surface(ax, [x; x], [y; y], [z; z], [c; c], ...
+            'FaceColor','none','EdgeColor','interp','LineWidth',trajWidth);
+    else
+        plot3(ax, Ri(:,1), Ri(:,2), Ri(:,3), ...
+            'Color',cols(i,:), 'LineWidth',trajWidth);
+    end
+
+    % 起点
+    plot3(ax, Ri(1,1), Ri(1,2), Ri(1,3), 'o', ...
+        'Color',cols(i,:), 'MarkerFaceColor',cols(i,:), 'MarkerSize',5);
+
+    % 终点
+    plot3(ax, Ri(end,1), Ri(end,2), Ri(end,3), 's', ...
+        'Color',cols(i,:), 'MarkerFaceColor',cols(i,:), 'MarkerSize',6);
+end
+
+% 目标点
+plot3(ax, rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'rp', ...
+    'MarkerFaceColor','r','MarkerSize',12);
+
+% V字连线（按时间抽样）
+for k = 1:vLineEvery:Nv
+    pts = squeeze(R(k,:,:))'/1e3;   % [nVeh x 3]
+
+    % 2-1-3
+    if nVeh >= 3
+        pL = pts(idxLeft,:); p1 = pts(idxLeader,:); pR = pts(idxRight,:);
+        plot3(ax, [pL(1) p1(1)], [pL(2) p1(2)], [pL(3) p1(3)], ...
+            '-', 'Color',[0.1 0.1 0.1 0.35], 'LineWidth', vLineWidth);
+        plot3(ax, [p1(1) pR(1)], [p1(2) pR(2)], [p1(3) pR(3)], ...
+            '-', 'Color',[0.1 0.1 0.1 0.35], 'LineWidth', vLineWidth);
+    end
+
+    % 1-4（尾机）
+    if nVeh >= 4
+        p4 = pts(idxTail,:); p1 = pts(idxLeader,:);
+        plot3(ax, [p1(1) p4(1)], [p1(2) p4(2)], [p1(3) p4(3)], ...
+            '--', 'Color',[0.2 0.2 0.2 0.30], 'LineWidth', vLineWidth);
+    end
+end
+
+% 末端当前队形高亮（最后一帧）
+ptsEnd = squeeze(R(end,:,:))'/1e3;
+if nVeh >= 3
+    pL = ptsEnd(idxLeft,:); p1 = ptsEnd(idxLeader,:); pR = ptsEnd(idxRight,:);
+    plot3(ax, [pL(1) p1(1) pR(1)], [pL(2) p1(2) pR(2)], [pL(3) p1(3) pR(3)], ...
+        'm-', 'LineWidth', 2.5);
+end
+if nVeh >= 4
+    p4 = ptsEnd(idxTail,:); p1 = ptsEnd(idxLeader,:);
+    plot3(ax, [p1(1) p4(1)], [p1(2) p4(2)], [p1(3) p4(3)], ...
+        'm--', 'LineWidth', 2.0);
+end
+
+xlabel(ax,'X_{ECEF} (km)');
+ylabel(ax,'Y_{ECEF} (km)');
+zlabel(ax,'Z_{ECEF} (km)');
+title(ax,'Enhanced 3D Trajectories with V-Formation Links');
+view(ax, 38, 24);
+
+% colorbar（时间渐变）
+if showTimeGradient
+    colormap(ax, turbo);
+    cb = colorbar(ax);
+    cb.Label.String = 'Normalized Time';
+end
+
+% 图例（简化）
+lgd = cell(1,nVeh+2);
+for i=1:nVeh
+    lgd{i} = sprintf('Vehicle %d', i);
+end
+lgd{nVeh+1} = 'Target';
+lgd{nVeh+2} = 'V-links';
+legend(ax, lgd, 'Location','bestoutside');
+
+% ---------- 可选：末段局部放大 ----------
+if showTerminalZoom
+    figure('Name','Terminal Zoom (Formation)','Color','w');
+    ax2 = axes; hold(ax2,'on'); grid(ax2,'on'); axis(ax2,'equal');
+
+    % 取末段窗口（最后10%）
+    ks = max(1, round(0.90*Nv));
+    for i = 1:nVeh
+        Ri = squeeze(R(ks:end,:,i))/1e3;
+        plot3(ax2, Ri(:,1), Ri(:,2), Ri(:,3), 'Color', cols(i,:), 'LineWidth', 2.0);
+        plot3(ax2, Ri(end,1), Ri(end,2), Ri(end,3), 'o', ...
+            'Color', cols(i,:), 'MarkerFaceColor', cols(i,:), 'MarkerSize', 6);
+    end
+    plot3(ax2, rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'rp', 'MarkerFaceColor','r','MarkerSize',12);
+
+    % 每隔几帧画V连线
+    step2 = max(1, floor((Nv-ks+1)/15));
+    for k2 = ks:step2:Nv
+        pts = squeeze(R(k2,:,:))'/1e3;
+        if nVeh >= 3
+            pL = pts(idxLeft,:); p1 = pts(idxLeader,:); pR = pts(idxRight,:);
+            plot3(ax2, [pL(1) p1(1) pR(1)], [pL(2) p1(2) pR(2)], [pL(3) p1(3) pR(3)], ...
+                '-', 'Color',[0 0 0 0.35], 'LineWidth', 1.4);
+        end
+        if nVeh >= 4
+            p4 = pts(idxTail,:); p1 = pts(idxLeader,:);
+            plot3(ax2, [p1(1) p4(1)], [p1(2) p4(2)], [p1(3) p4(3)], ...
+                '--', 'Color',[0 0 0 0.30], 'LineWidth', 1.2);
+        end
+    end
+
+    xlabel(ax2,'X_{ECEF} (km)');
+    ylabel(ax2,'Y_{ECEF} (km)');
+    zlabel(ax2,'Z_{ECEF} (km)');
+    title(ax2,'Terminal Phase Zoom with Formation Skeleton');
+    view(ax2, 45, 28);
+end

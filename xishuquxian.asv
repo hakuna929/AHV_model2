@@ -1,0 +1,57 @@
+clear; clc; close all;
+
+%% 固定工况（可改）
+Ma    = 6.5;            % 马赫数
+beta  = 0 * pi/180;     % 侧滑角 [rad]
+de1   = 0 * pi/180;     % 舵偏 [rad]
+de2   = 0 * pi/180;
+dr    = 0 * pi/180;
+
+%% ===== 1) 推力系数 CT 随油门 dT =====
+dT_vec = linspace(0.05, 1.0, 60);   % 油门开度范围
+CT_vec = zeros(size(dT_vec));
+
+% 这里 alpha 固定一个代表值
+alpha_for_CT = 5 * pi/180;
+
+for i = 1:numel(dT_vec)
+    dT = dT_vec(i);
+    % 需要你已有 thrust_coeffs(Ma,alpha,beta,dT)
+    CT_vec(i) = thrust_coeffs(Ma, alpha_for_CT, beta, dT);
+end
+
+figure('Name','CT vs dT');
+plot(dT_vec, CT_vec, 'b-', 'LineWidth', 1.8); grid on;
+xlabel('Throttle dT');
+ylabel('Thrust Coefficient C_T');
+title(sprintf('C_T vs dT (Ma=%.2f, \\alpha=%.1f deg, \\beta=%.1f deg)', ...
+    Ma, rad2deg(alpha_for_CT), rad2deg(beta)));
+
+%% ===== 2) CL / CD 随攻角 alpha =====
+alpha_deg_vec = linspace(-5, 20, 100);
+CL_vec = zeros(size(alpha_deg_vec));
+CD_vec = zeros(size(alpha_deg_vec));
+
+% 固定油门（气动+推进组合里，CL/CD会受dT影响）
+dT_for_aero = 0.6;
+
+for i = 1:numel(alpha_deg_vec)
+    alpha = deg2rad(alpha_deg_vec(i));
+    [CL, CD, ~, ~, ~, ~] = aero_coeffs(Ma, alpha, beta, de1, de2, dr, dT_for_aero);
+    CL_vec(i) = CL;
+    CD_vec(i) = CD;
+end
+
+figure('Name','CL CD vs alpha');
+yyaxis left
+plot(alpha_deg_vec, CL_vec, 'r-', 'LineWidth', 1.8); grid on;
+ylabel('Lift Coefficient C_L');
+
+yyaxis right
+plot(alpha_deg_vec, CD_vec, 'k--', 'LineWidth', 1.8);
+ylabel('Drag Coefficient C_D');
+
+xlabel('Angle of Attack \alpha (deg)');
+title(sprintf('C_L / C_D vs \\alpha (Ma=%.2f, dT=%.2f, \\beta=%.1f deg)', ...
+    Ma, dT_for_aero, rad2deg(beta)));
+legend('C_L','C_D','Location','best');
