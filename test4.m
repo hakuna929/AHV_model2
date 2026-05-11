@@ -7,7 +7,7 @@ clear; clc;
 
 %% ===================== 时间 =====================
 dt_base = 0.1;
-T_end   = 3500;
+T_end   = 2000;
 N_max   = ceil(T_end/dt_base)*6;   % 给自适应步长留裕度
 
 %% ===================== 常量 =====================
@@ -367,13 +367,15 @@ while k <= N_max && t_now <= T_end
         F_thrust =  T_eng * fwd;
         F_ecef   = F_drag + F_lift + F_thrust;
 
-        if use_simple_gravity
+        if use_simple_gravity == true
             g_ecef = -mu/norm(ri)^3 * ri;
         end
 
-        if use_rotation_terms
+        if use_rotation_terms == true
             a_ecef = g_ecef + F_ecef/mi - 2*cross(omega_ie,vi) - cross(omega_ie,cross(omega_ie,ri));
-        else
+        end
+
+        if use_rotation_terms == false 
             a_ecef = g_ecef + F_ecef/mi;
         end
 
@@ -474,7 +476,7 @@ legend('Earth','Veh1','Veh2','Veh3','Veh4','Target','Location','best');
 % rT   : [3 x 1] 目标ECEF
 % Re   : 地球半径
 
-figure('Name','All Vehicles 3D Trajectories');
+figure;
 hold on; grid on; axis equal;
 
 % 地球
@@ -506,7 +508,7 @@ plot3(rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'rp', ...
 xlabel('X_{ECEF} (km)');
 ylabel('Y_{ECEF} (km)');
 zlabel('Z_{ECEF} (km)');
-title('3D Trajectories of All Vehicles');
+title('3D Trajectories');
 
 % 图例
 lgd = cell(1,nVeh+1);
@@ -573,7 +575,7 @@ idxTail   = min(4,nVeh);
 cols = lines(max(nVeh,4));
 
 % ---------- 主图 ----------
-fig = figure('Name','Enhanced 3D Formation Visualization','Color','w');
+fig = figure;
 ax = axes(fig); hold(ax,'on'); grid(ax,'on'); axis(ax,'equal');
 
 % 地球
@@ -648,7 +650,7 @@ end
 xlabel(ax,'X_{ECEF} (km)');
 ylabel(ax,'Y_{ECEF} (km)');
 zlabel(ax,'Z_{ECEF} (km)');
-title(ax,'Enhanced 3D Trajectories with V-Formation Links');
+title(ax,'3D Trajectories');
 view(ax, 38, 24);
 
 % colorbar（时间渐变）
@@ -669,7 +671,7 @@ legend(ax, lgd, 'Location','bestoutside');
 
 % ---------- 可选：末段局部放大 ----------
 if showTerminalZoom
-    figure('Name','Terminal Zoom (Formation)','Color','w');
+    figure;
     ax2 = axes; hold(ax2,'on'); grid(ax2,'on'); axis(ax2,'equal');
 
     % 取末段窗口（最后10%）
@@ -701,6 +703,6 @@ if showTerminalZoom
     xlabel(ax2,'X_{ECEF} (km)');
     ylabel(ax2,'Y_{ECEF} (km)');
     zlabel(ax2,'Z_{ECEF} (km)');
-    title(ax2,'Terminal Phase Zoom with Formation Skeleton');
+    title(ax2,'ecef_3D_all');
     view(ax2, 45, 28);
 end

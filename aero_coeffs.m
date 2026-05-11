@@ -69,31 +69,23 @@
 % end
 
 
-function [CL, CD, CY, Cl, Cm, Cn] = aero_coeffs(Ma, alpha, beta, de1, de2, dr, dT)
-% 3DOF简化一致版气动系数
-% 目的：
-% 1) 3DOF不考虑舵偏动态影响 -> 舵偏输入不参与CL/CD/CY（固定为配平思想）
-% 2) 去掉dT对气动系数耦合 -> 推进只由 thrust_coeffs 负责
-% 3) 保留原接口，避免主程序改动
-%
+function [CL, CD, CT] = aero_coeffs(Ma, alpha, dT)
+% 3DOF简化版气动系数
+% 目的：3DOF不考虑舵偏动态影响 -> 舵偏输入不参与CL/CD/CY（固定为配平思想）
 % 输入:
-%   Ma, alpha(rad), beta(rad), de1,de2,dr,dT  (后四者在本模型中不参与气动力计算)
+%   Ma, alpha(rad),dT
 % 输出:
-%   CL,CD,CY 参与3DOF平动；Cl,Cm,Cn仅占位返回0
-
-    %#ok<*INUSD>  % de1,de2,dr,dT在此简化模型中不使用
+%   CL,CD,CT 参与3DOF平动
 
     %% -------- 单位转换 --------
     adeg = alpha * 180/pi;
-    bdeg = beta  * 180/pi;
 
     %% -------- 输入限幅（数值稳定）--------
     Ma   = min(max(Ma,   0.0), 8.0);
-    adeg = min(max(adeg,-10.0), 10.0);
-    bdeg = min(max(bdeg,-6.0), 6.0);
+    adeg = min(max(adeg,-2.0), 10.0);
 
-    %% -------- 升力系数 CL（仅Ma,alpha,beta）--------
-    % 采用你原模型去舵偏后的主体项：
+    %% -------- 升力系数 CL（仅Ma,alpha）--------
+    % 原模型去舵偏后的主体项：
     CL = 0.1498 ...
        - 0.02751 * Ma ...
        + 0.07235 * adeg ...
@@ -101,33 +93,33 @@ function [CL, CD, CY, Cl, Cm, Cn] = aero_coeffs(Ma, alpha, beta, de1, de2, dr, d
        + 0.002343 * Ma.^2 ...
        + 0.001185 * adeg.^2;
 
-    % 轻微侧滑惩罚（可关）
-    CL = CL - 0.0005 * bdeg.^2;
-
-    %% -------- 阻力系数 CD（仅Ma,alpha,beta）--------
+    %% -------- 阻力系数 CD（仅Ma,alpha）--------
     CD = 0.05099 ...
        - 0.004863 * Ma ...
        + 0.002967 * adeg ...
        + 0.001364 * adeg.^2;
 
-    % 侧滑附加阻力（可调小）
-    CD = CD + 0.00025 * bdeg.^2;
-
-    %% -------- 侧力系数 CY（简化）--------
-    % 若你希望"纯纵向/平面"先收敛，可直接 CY=0
-    CY = 0.04626 * bdeg ...
-       - 0.002833 * bdeg * Ma ...
-       - 0.0003691 * adeg * bdeg;
-    % 如果要完全关闭侧向力，改成：
-    % CY = 0;
 
     %% -------- 系数硬限幅（防数值炸裂）--------
     CL = min(max(CL, -2.2), 2.2);
     CD = min(max(CD,  0.015), 1.2);
-    CY = min(max(CY, -0.8), 0.8);
 
-    %% -------- 3DOF中不用的力矩系数 --------
-    Cl = 0.0;
-    Cm = 0.0;
-    Cn = 0.0;
+    %  C_Tc = C_Tc(Ma,α,δ_T)
+    CTc =  0.1029      * dT ...
+        + 0.02022     * Ma * dT ...
+        - 0.001757    * adeg  * dT ...
+        + 0.000088233 * adeg.^2 * dT ...
+        + 0.001221    * Ma.^2 .* dT;
+
+    %  C_Tn = C_Tn(Ma,α,δ_T)
+    CTn =  0.03791 ...
+        + 0.005176   * adeg ...
+        - 0.01235    * Ma ...
+        - 0.00054887 * Ma* adeg ...
+        + 0.00096897 * Ma.^2 ...
+        + 0.05627    * dT ...
+        - 0.00077467 * (adeg * dT) ...
+        + 0.002103   * Ma  * dT;
+    
+    CT = CTc + CTn;
 end
