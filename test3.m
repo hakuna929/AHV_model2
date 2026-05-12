@@ -193,8 +193,8 @@ while k <= N_max && t_now <= T_end
 
     % --- 局部基 ---
     u_up = r / norm(r);
-    eE = [-sin(lon); cos(lon); 0];
-    eN = [-sin(lat)*cos(lon); -sin(lat)*sin(lon); cos(lat)];
+    eE = [-sind(lon); cosd(lon); 0];
+    eN = [-sind(lat)*cosd(lon); -sind(lat)*sind(lon); cosd(lat)];
 
     v_h = v - dot(v,u_up)*u_up;
     Vh = max(norm(v_h),1e-6);
@@ -344,7 +344,7 @@ while k <= N_max && t_now <= T_end
     dT_grid = linspace(dT_min,dT_max,41);
     CT_grid = zeros(size(dT_grid));
     for ii=1:numel(dT_grid)
-        CT_grid(ii) = thrust_coeffs(Ma, alpha_cmd, 0, dT_grid(ii));
+        CT_grid(ii) = thrust_coeffs(Ma, alpha_cmd, dT_grid(ii));
     end
     [~,ix] = min(abs(CT_grid - CT_cmd));
     dT_target = dT_grid(ix);
@@ -352,7 +352,7 @@ while k <= N_max && t_now <= T_end
     dT = dT + (dT_target - dT)*dt_use/tau_dT;
     dT = min(max(dT,dT_min),dT_max);
 
-    CT = thrust_coeffs(Ma, alpha_cmd, 0, dT);
+    CT = thrust_coeffs(Ma, alpha_cmd,  dT);
     T_eng = CT*qbar*S_ref;
 
     %% ================= 力与积分 =================
@@ -408,6 +408,11 @@ while k <= N_max && t_now <= T_end
     end
 
     k = k + 1;
+
+    if k < 120
+    fprintf("t=%.2f h=%.0f V=%.0f rho=%.4f q=%.0f  CT=%.3f  T=%.0f  D=%.0f  L=%.0f  v_up=%.1f\n", ...
+        t_now, h, V, rho, qbar, CT, T_eng, D, L, v_up);
+    end
 end
 
 %% ===================== 截断有效数据 =====================
