@@ -7,7 +7,7 @@ function [lat, lon, h] = ecef2lla_cgcs2000(r_ecef)
     x = r_ecef(1); y = r_ecef(2); z = r_ecef(3);
     
     % 经度可直接计算
-    lon = atan2(y, x);
+    lon = atan2d(y, x);
     
     % 纬度与高度迭代
     p = sqrt(x^2 + y^2);
@@ -16,6 +16,6 @@ function [lat, lon, h] = ecef2lla_cgcs2000(r_ecef)
         sin_lat = sin(lat);
         N = a / sqrt(1 - e2 * sin_lat^2);
         h = p / cos(lat) - N;
-        lat = atan2(z, p * (1 - e2 * N / (N + h)));
+        lat = atan2d(z, p * (1 - e2 * N / (N + h)));
     end
 end

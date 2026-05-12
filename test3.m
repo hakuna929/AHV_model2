@@ -8,6 +8,11 @@
 %
 % 依赖函数：
 % lla2ecef_cgcs2000, ecef2lla_cgcs2000, atmos_simple, aero_coeffs, thrust_coeffs
+%
+% 注意：本版本已适配"更新后的气动系数/推力系数"接口：
+%   aero_coeffs(Ma, alpha, dT) -> [CL, CD, CT]
+%   thrust_coeffs(Ma, alpha, beta, dT) -> CT（若你已将 thrust_coeffs 也更新为简化版，
+%   可直接把下面的 thrust_coeffs 调用替换掉/删除）
 
 clear; clc;
 
@@ -117,6 +122,7 @@ Mcmd_hist = nan(N_max,1);
 dT_hist = nan(N_max,1);
 CL_hist = nan(N_max,1);
 CD_hist = nan(N_max,1);
+CT_hist = nan(N_max,1);
 CTff_hist = nan(N_max,1);
 CTcmd_hist = nan(N_max,1);
 L1_hist = nan(N_max,1);
@@ -283,7 +289,7 @@ while k <= N_max && t_now <= T_end
 
     CL_req = (m*a_cmd_norm)/max(qbar*S_ref,1);
 
-    % 线性反推alpha
+    % 线性反推alpha（与更新后 aero_coeffs 的 CL 拟合一致的近似斜率/截距）
     adeg_est = 2.0;
     CL_alpha_rad = (0.07235 - 0.003368*Ma) * (180/pi);
     CL_alpha_rad = max(CL_alpha_rad,0.1);
@@ -299,7 +305,7 @@ while k <= N_max && t_now <= T_end
     chi_v = atan2(dot(u_vh,eE), dot(u_vh,eN));
     psi_cmd = chi_v;
 
-    phi = phi_cmd; theta = theta_cmd; psi = psi_cmd; 
+    phi = phi_cmd; theta = theta_cmd; psi = psi_cmd;
 
     %% ================= 速度控制（CT前馈+PI） =================
     if R_to_T > 900e3
@@ -311,8 +317,12 @@ while k <= N_max && t_now <= T_end
     end
     V_cmd = max(M_cmd*a_snd, V_floor);
 
-    [CL,CD,CY,~,~,~] = aero_coeffs(Ma, alpha_cmd, 0, de1, de2, dr, dT);
-    CY = 0;
+    % 更新后的 aero_coeffs 接口：只返回 [CL, CD, CT]
+    % 这里 CT 是"由 Ma/alpha/dT 计算得到的推力系数"，但用于速度环更稳妥的方式是：
+    % - 用 CL/CD 计算 D，得到 CT_ff
+    % - 速度环输出 CT_cmd
+    % - 再做 CT->dT 反解
+    [CL, CD, ~] = aero_coeffs(Ma, alpha_cmd, dT);
 
     L = CL*qbar*S_ref;
     D = CD*qbar*S_ref;
@@ -330,7 +340,7 @@ while k <= N_max && t_now <= T_end
         int_v = int_v - 0.7*v_err*dt_use; % anti-windup
     end
 
-    % CT->dT 反解
+    % CT->dT 反解（仍使用 thrust_coeffs 作为"CT(dT)"的模型）
     dT_grid = linspace(dT_min,dT_max,41);
     CT_grid = zeros(size(dT_grid));
     for ii=1:numel(dT_grid)
@@ -358,7 +368,7 @@ while k <= N_max && t_now <= T_end
     F_ecef = F_drag_e + F_lift_e + F_thrust_e;
 
     if use_simple_gravity
-        g_ecef = -mu/norm(r)^3 * r; 
+        g_ecef = -mu/norm(r)^3 * r;
     end
 
     if use_rotation_terms
@@ -384,6 +394,7 @@ while k <= N_max && t_now <= T_end
     dT_hist(k) = dT;
     CL_hist(k) = CL;
     CD_hist(k) = CD;
+    CT_hist(k) = CT;
     CTff_hist(k) = CT_ff;
     CTcmd_hist(k) = CT_cmd;
     L1_hist(k) = L1_dist;
@@ -414,6 +425,7 @@ Mcmdk = Mcmd_hist(valid);
 dTk = dT_hist(valid);
 CLk = CL_hist(valid);
 CDk = CD_hist(valid);
+CTk = CT_hist(valid);
 CTffk = CTff_hist(valid);
 CTcmdk = CTcmd_hist(valid);
 L1k = L1_hist(valid);
@@ -457,6 +469,11 @@ title('CT Feedforward / CT Command');
 legend('CT_{ff}','CT_{cmd}','Location','best');
 
 figure;
+plot(tt, CTk, 'k', 'LineWidth',1.2); grid on;
+xlabel('Time (s)'); ylabel('C_T (actual)');
+title('CT Actual (from thrust model)');
+
+figure;
 plot(tt, CLk, 'b', 'LineWidth',1.2); hold on; grid on;
 plot(tt, CDk, 'r--', 'LineWidth',1.2);
 xlabel('Time (s)'); ylabel('Coefficient');
@@ -470,7 +487,7 @@ title('L1 Distance Scheduling');
 
 figure;
 plot(tt, alatk, 'LineWidth',1.3); grid on;
-xlabel('Time (s)'); ylabel('a_{lat,cmd} (m/s^2)');
+xlabel('Time (s))'); ylabel('a_{lat,cmd} (m/s^2)');
 title('Lateral Acceleration Command');
 
 figure;
@@ -481,3 +498,56 @@ plot3(rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'ro','MarkerFaceColor','r');
 xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
 title('Trajectory in ECEF (Terminal Version)');
 legend('Vehicle','Earth','Target','Location','best');
+
+%% ===================== 绘图（发射系 ENU） =====================
+% 参考点：发射点（初始点）
+r0 = lla2ecef_cgcs2000(lat0, lon0, h0).';
+r0 = r0(:);
+
+% ECEF -> ENU 旋转矩阵（以发射点为原点的本地坐标系）
+slat = sin(lat0); clat = cos(lat0);
+slon = sin(lon0); clon = cos(lon0);
+
+C_ecef2enu = [ -slon,        clon,       0;
+               -slat*clon,  -slat*slon,   clat;
+                clat*clon,   clat*slon,   slat ];
+
+% 位置差（ECEF）
+dR = (Rk.' - r0);          % 3 x N
+enu = C_ecef2enu * dR;     % 3 x N
+
+E = enu(1,:)/1e3;
+N = enu(2,:)/1e3;
+U = enu(3,:)/1e3;
+
+figure;
+plot3(E, N, U, 'b', 'LineWidth', 1.5); grid on; axis equal;
+xlabel('East (km)'); ylabel('North (km)'); zlabel('Up (km)');
+title('Trajectory in Launch Frame (ENU)');
+
+
+%% ---------- 轨迹经纬度图（地面投影 Lat/Lon） ----------
+% 说明：ecef2lla_cgcs2000 的 lat/lon 单位以该函数实现为准（你工程里看起来是"度"）
+
+Ntraj = size(Rk,1);
+lat_traj = nan(Ntraj,1);
+lon_traj = nan(Ntraj,1);
+h_traj   = nan(Ntraj,1);
+
+for ii = 1:Ntraj
+    [lat_traj(ii), lon_traj(ii), h_traj(ii)] = ecef2lla_cgcs2000(Rk(ii,:));
+end
+
+figure;
+plot(lon_traj, lat_traj, 'b', 'LineWidth', 1.5); grid on; hold on;
+plot(lon0, lat0, 'go', 'MarkerFaceColor','g');   % 发射点
+plot(lonT, latT, 'ro', 'MarkerFaceColor','r');   % 目标点
+xlabel('Longitude'); ylabel('Latitude');
+title('Trajectory Ground Track (Lat/Lon)');
+legend('Trajectory','Launch','Target','Location','best');
+
+% 若跨越日期变更线（±180°）导致折线"拉跨"，可用 unwrap 处理（单位：度）
+% lon_u = rad2deg(unwrap(deg2rad(lon_traj)));
+% figure; plot(lon_u, lat_traj, 'b', 'LineWidth', 1.5); grid on;
+% xlabel('Longitude (unwrapped, deg)'); ylabel('Latitude (deg)');
+% title('Trajectory Ground Track (Lat/Lon, unwrapped)');
