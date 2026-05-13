@@ -7,18 +7,19 @@
 % 4) 最近点判据（Vc<=0 且近距）防"飞过后还继续跑"
 %
 % 依赖函数：
-% lla2ecef_cgcs2000, ecef2lla_cgcs2000, atmos_simple, aero_coeffs, thrust_coeffs
+% lla2ecef_cgcs2000, ecef2lla_cgcs2000, atmos_simple, aero_coeffs
 %
-% 注意：本版本已适配"更新后的气动系数/推力系数"接口：
-%   aero_coeffs(Ma, alpha, dT) -> [CL, CD, CT]
-%   thrust_coeffs(Ma, alpha, beta, dT) -> CT（若你已将 thrust_coeffs 也更新为简化版，
-%   可直接把下面的 thrust_coeffs 调用替换掉/删除）
+% 注意：
+% - 本工程 lla2ecef_cgcs2000 输入 lat/lon 为"度"
+% - ecef2lla_cgcs2000 输出 lat/lon 为"度"
+% - 因此在本脚本中，凡是对 lat/lon 做三角函数运算，一律使用 sind/cosd
+% - 姿态/alpha/phi/theta 等仍使用"弧度"
 
 clear; clc;
 
 %% ===================== 仿真时间 =====================
 dt_base = 0.1;
-T_end   = 3500;
+T_end   = 3000;
 N_max   = ceil(T_end/dt_base) * 5;  % 预留给末段小步长
 
 %% ===================== 常量 =====================
@@ -35,10 +36,10 @@ m     = 671.33;
 S_ref = 0.2986;
 
 %% ===================== 初始/目标 =====================
-h0 = 30e3; lat0 = 19.2; lon0 = 110.5;
+h0 = 30e3; lat0 = 19.2; lon0 = 110.5;   % lat/lon 单位：度
 r = lla2ecef_cgcs2000(lat0, lon0, h0); r = r(:);
 
-latT = 13.35; lonT = 144.55; hT = 30e3;
+latT = 13.35; lonT = 144.55; hT = 30e3; % 度
 rT = lla2ecef_cgcs2000(latT, lonT, hT); rT = rT(:);
 
 [a0,~] = atmos_simple(h0);
@@ -64,8 +65,6 @@ seg0_h = seg0 - dot(seg0,u_up0)*u_up0;
 if norm(seg0_h) < 1e-6, seg0_h = seg0; end
 v = V0 * seg0_h / norm(seg0_h);
 
-% 姿态（3DOF理想跟踪）
-phi = 0; theta = 0; psi = 0;
 
 %% ===================== 控制参数 =====================
 % L1
@@ -75,11 +74,11 @@ a_lat_max_cruise = 60;   % 巡航段
 a_lat_max_term   = 140;  % 末段增强
 
 % 纵向高度环
-Kph = 0.010; Kih = 0.00002; Kdh = 0.08;
+Kph = 0.010; Kih = 0.00002; Kdh = 0.008;
 int_h = 0; int_h_lim = 8e4;
 a_h_max = 25;
 
-% alpha/phi 限幅
+% alpha/phi 限幅（弧度）
 phi_lim   = 65*pi/180;
 theta_lim = 35*pi/180;
 alpha_min = -2*pi/180;
@@ -89,15 +88,15 @@ alpha_max = 18*pi/180;
 Kpv = 0.0018; Kiv = 0.00025;
 int_v = 0; int_v_lim = 8e3;
 
-CT_min = 0.00; CT_max = 0.45;
+CT_min = 0.05; CT_max = 0.1;
 dT_min = 0.10; dT_max = 1.00;
-tau_dT = 0.6; dT = 0.65;
+tau_dT = 0.3; dT = 0.5;
 
 % 马赫指令
-M_cmd_far  = 6.2;
-M_cmd_mid  = 5.2;
-M_cmd_near = 4.5;
-V_floor    = 750;
+M_cmd_far  = 6.5;
+M_cmd_mid  = 6.5;
+M_cmd_near = 6.5;
+V_floor    = 1100;
 
 % 终端捕获参数
 R_hit            = 1000;    % 1 km 命中
@@ -105,9 +104,6 @@ R_term1          = 120e3;   % 进入末段1
 R_term2          = 40e3;    % 进入末段2（更激进）
 R_pass_check     = 20e3;    % 最近点判据启用距离
 R_abort_diverge  = 50e3;    % 若近距后发散可停
-
-% 舵偏固定（3DOF简化）
-de1 = 0; de2 = 0; dr = 0;
 
 %% ===================== 记录数组 =====================
 t_log = nan(N_max,1);
@@ -136,10 +132,24 @@ t_now = 0;
 prev_R = inf;
 min_R = inf;
 
+did_unit_check = false;
+
 %% ===================== 主循环 =====================
 while k <= N_max && t_now <= T_end
     % --- 当前地理量 ---
-    [lat, lon, h] = ecef2lla_cgcs2000(r');
+    % ecef2lla_cgcs2000 返回 lat/lon 单位：度（见函数内部 atan2d）
+    [lat_deg, lon_deg, h] = ecef2lla_cgcs2000(r');
+
+    % % 自检：确认输出看起来像"度"
+    % if ~did_unit_check
+    %     did_unit_check = true;
+    %     if abs(lat_deg) <= pi && abs(lon_deg) <= pi
+    %         fprintf('[WARN] ecef2lla 输出看起来像弧度(lat=%.4f,lon=%.4f)，但本工程函数通常应输出度，请检查 ecef2lla_cgcs2000 实现。\n', lat_deg, lon_deg);
+    %     else
+    %         fprintf('[INFO] ecef2lla 输出单位判定为"度"(lat=%.3f deg, lon=%.3f deg)。\n', lat_deg, lon_deg);
+    %     end
+    % end
+
     if h <= 20e3
         stop_reason = "terrain impact";
         fprintf('Vehicle impacted terrain at t=%.1f s\n', t_now);
@@ -193,8 +203,10 @@ while k <= N_max && t_now <= T_end
 
     % --- 局部基 ---
     u_up = r / norm(r);
-    eE = [-sind(lon); cosd(lon); 0];
-    eN = [-sind(lat)*cosd(lon); -sind(lat)*sind(lon); cosd(lat)];
+
+    % lat/lon 为"度"，所以这里使用 sind/cosd
+    eE = [-sind(lon_deg); cosd(lon_deg); 0];
+    eN = [-sind(lat_deg)*cosd(lon_deg); -sind(lat_deg)*sind(lon_deg); cosd(lat_deg)];
 
     v_h = v - dot(v,u_up)*u_up;
     Vh = max(norm(v_h),1e-6);
@@ -251,7 +263,7 @@ while k <= N_max && t_now <= T_end
     a_lat_vec = a_lat_cmd * right_h;
 
     %% ================= 纵向高度PID =================
-    [~,~,h_wp_next] = ecef2lla_cgcs2000(r_wp_next');
+    [~,~,h_wp_next] = ecef2lla_cgcs2000(r_wp_next'); % h_wp_next 单位：m
     h_cmd = h_wp_next;
 
     v_up = dot(v,u_up);
@@ -317,12 +329,8 @@ while k <= N_max && t_now <= T_end
     end
     V_cmd = max(M_cmd*a_snd, V_floor);
 
-    % 更新后的 aero_coeffs 接口：只返回 [CL, CD, CT]
-    % 这里 CT 是"由 Ma/alpha/dT 计算得到的推力系数"，但用于速度环更稳妥的方式是：
-    % - 用 CL/CD 计算 D，得到 CT_ff
-    % - 速度环输出 CT_cmd
-    % - 再做 CT->dT 反解
-    [CL, CD, ~] = aero_coeffs(Ma, alpha_cmd, dT);
+    % aero_coeffs 同时输出 CL/CD/CT（CT为推力系数）
+    [CL, CD, CT_now] = aero_coeffs(Ma, alpha_cmd, dT);
 
     L = CL*qbar*S_ref;
     D = CD*qbar*S_ref;
@@ -340,11 +348,11 @@ while k <= N_max && t_now <= T_end
         int_v = int_v - 0.7*v_err*dt_use; % anti-windup
     end
 
-    % CT->dT 反解（仍使用 thrust_coeffs 作为"CT(dT)"的模型）
+    % CT->dT 反解：用 aero_coeffs 的 CT(dT)
     dT_grid = linspace(dT_min,dT_max,41);
     CT_grid = zeros(size(dT_grid));
     for ii=1:numel(dT_grid)
-        CT_grid(ii) = thrust_coeffs(Ma, alpha_cmd, dT_grid(ii));
+        [~,~,CT_grid(ii)] = aero_coeffs(Ma, alpha_cmd, dT_grid(ii));
     end
     [~,ix] = min(abs(CT_grid - CT_cmd));
     dT_target = dT_grid(ix);
@@ -352,8 +360,12 @@ while k <= N_max && t_now <= T_end
     dT = dT + (dT_target - dT)*dt_use/tau_dT;
     dT = min(max(dT,dT_min),dT_max);
 
-    CT = thrust_coeffs(Ma, alpha_cmd,  dT);
-    T_eng = CT*qbar*S_ref;
+    % 实际推力
+    [~,~,CT] = aero_coeffs(Ma, alpha_cmd, dT);
+
+
+    %% 推力太小调试
+    T_eng =5 * CT*qbar*S_ref;
 
     %% ================= 力与积分 =================
     if norm(v_h) > 1e-6
@@ -408,11 +420,18 @@ while k <= N_max && t_now <= T_end
     end
 
     k = k + 1;
+    
+    % if k < 100
+    % fprintf("t=%.2f h=%.0f V=%.0f rho=%.4f q=%.0f  CT=%.3f  T=%.0f  D=%.0f  L=%.0f  v_up=%.1f\n", ...
+    %     t_now, h, V, rho, qbar, CT, T_eng, D, L, v_up);
+    % end
 
-    if k < 120
-    fprintf("t=%.2f h=%.0f V=%.0f rho=%.4f q=%.0f  CT=%.3f  T=%.0f  D=%.0f  L=%.0f  v_up=%.1f\n", ...
-        t_now, h, V, rho, qbar, CT, T_eng, D, L, v_up);
+
+    if mod(round(t_now,1),1.0)==0
+    fprintf("t=%.0f h=%.0f v_up=%.1f  L/W=%.2f  (T-D)=%.0f\n", ...
+        t_now, h, v_up, L/(m*9.81), (T_eng-D));
     end
+
 end
 
 %% ===================== 截断有效数据 =====================
@@ -476,7 +495,7 @@ legend('CT_{ff}','CT_{cmd}','Location','best');
 figure;
 plot(tt, CTk, 'k', 'LineWidth',1.2); grid on;
 xlabel('Time (s)'); ylabel('C_T (actual)');
-title('CT Actual (from thrust model)');
+title('CT Actual (from aero\_coeffs)');
 
 figure;
 plot(tt, CLk, 'b', 'LineWidth',1.2); hold on; grid on;
@@ -505,13 +524,13 @@ title('Trajectory in ECEF (Terminal Version)');
 legend('Vehicle','Earth','Target','Location','best');
 
 %% ===================== 绘图（发射系 ENU） =====================
-% 参考点：发射点（初始点）
+% 参考点：发射点（初始点） lat0/lon0 为度
 r0 = lla2ecef_cgcs2000(lat0, lon0, h0).';
 r0 = r0(:);
 
 % ECEF -> ENU 旋转矩阵（以发射点为原点的本地坐标系）
-slat = sin(lat0); clat = cos(lat0);
-slon = sin(lon0); clon = cos(lon0);
+slat = sind(lat0); clat = cosd(lat0);
+slon = sind(lon0); clon = cosd(lon0);
 
 C_ecef2enu = [ -slon,        clon,       0;
                -slat*clon,  -slat*slon,   clat;
@@ -530,10 +549,7 @@ plot3(E, N, U, 'b', 'LineWidth', 1.5); grid on; axis equal;
 xlabel('East (km)'); ylabel('North (km)'); zlabel('Up (km)');
 title('Trajectory in Launch Frame (ENU)');
 
-
 %% ---------- 轨迹经纬度图（地面投影 Lat/Lon） ----------
-% 说明：ecef2lla_cgcs2000 的 lat/lon 单位以该函数实现为准（你工程里看起来是"度"）
-
 Ntraj = size(Rk,1);
 lat_traj = nan(Ntraj,1);
 lon_traj = nan(Ntraj,1);
@@ -547,7 +563,7 @@ figure;
 plot(lon_traj, lat_traj, 'b', 'LineWidth', 1.5); grid on; hold on;
 plot(lon0, lat0, 'go', 'MarkerFaceColor','g');   % 发射点
 plot(lonT, latT, 'ro', 'MarkerFaceColor','r');   % 目标点
-xlabel('Longitude'); ylabel('Latitude');
+xlabel('Longitude (deg)'); ylabel('Latitude (deg)');
 title('Trajectory Ground Track (Lat/Lon)');
 legend('Trajectory','Launch','Target','Location','best');
 
