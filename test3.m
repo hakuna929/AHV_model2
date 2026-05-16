@@ -1,5 +1,5 @@
 % main_3dof_L1_terminal.m
-% 3DOF终端版：L1航线跟踪 + 高度/速度保持 + 末段捕获增强
+% 3DOFL1航线跟踪 + 高度/速度保持 + 末段捕获增强
 % 关键增强：
 % 1) 末段自适应步长 dt_use（防跨步飞过）
 % 2) 末段L1缩距 + 横向过载上调
@@ -18,7 +18,7 @@
 clear; clc;
 
 %% ===================== 仿真时间 =====================
-dt_base = 0.1;
+dt_base = 0.01;
 T_end   = 3000;
 N_max   = ceil(T_end/dt_base) * 5;  % 预留给末段小步长
 
@@ -572,3 +572,27 @@ legend('Trajectory','Launch','Target','Location','best');
 % figure; plot(lon_u, lat_traj, 'b', 'LineWidth', 1.5); grid on;
 % xlabel('Longitude (unwrapped, deg)'); ylabel('Latitude (deg)');
 % title('Trajectory Ground Track (Lat/Lon, unwrapped)');
+
+
+%% ===================== 轨迹经纬高(LLA)三维图 =====================
+% lat_traj / lon_traj / h_traj 已在上面由 ecef2lla_cgcs2000 计算得到
+% 注意：lat/lon 单位为"度"，h 单位为"m"
+
+figure;
+plot3(lon_traj, lat_traj, h_traj/1000, 'b', 'LineWidth', 1.5); grid on; hold on;
+plot3(lon0, lat0, h0/1000, 'go', 'MarkerFaceColor','g');   % 发射点
+plot3(lonT, latT, hT/1000, 'ro', 'MarkerFaceColor','r');   % 目标点
+xlabel('Longitude (deg)'); ylabel('Latitude (deg)'); zlabel('Altitude (km)');
+title('Trajectory in LLA (Lon-Lat-Alt)');
+legend('Trajectory','Launch','Target','Location','best');
+view(3);
+
+%% （可选）高度随经度/纬度变化的剖面
+figure;
+subplot(2,1,1);
+plot(lon_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
+xlabel('Longitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Longitude');
+
+subplot(2,1,2);
+plot(lat_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
+xlabel('Latitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Latitude');
