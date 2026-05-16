@@ -1,10 +1,19 @@
 % main_3dof_L1_terminal.m
-% 3DOFL1航线跟踪 + 高度/速度保持 + 末段捕获增强
-% 关键增强：
-% 1) 末段自适应步长 dt_use（防跨步飞过）
-% 2) 末段L1缩距 + 横向过载上调
-% 3) 严格命中判据（R_hit）
-% 4) 最近点判据（Vc<=0 且近距）防"飞过后还继续跑"
+% 3DOFL1航线跟踪 + 定高/定速巡航 + 末段捕获增强（alpha严格限制版本）
+% ------------------------------------------------------------
+% 你提出的约束/假设：
+% 1) 姿态(phi/theta/psi)视为"直接可控量"（等价于内环完美跟踪）
+% 2) 巡航段高度保持：h_cmd = 30 km 常数（不再跟随航点高度）
+% 3) 超燃冲压/推力系数 CT 的推力模型中原来 "系数5" 仅为调试：现移除
+%    推力：T_eng = CT * qbar * S_ref   （若你有实际发动机标定，可再换成 T=CT*qS*...）
+% 4) 攻角限制：alpha ∈ [-2°, +1°]（巡航段推荐小攻角）
+%
+% 控制结构（适合高超声速巡航）：
+% - 横向：L1 航线跟踪 -> a_lat_cmd
+% - 纵向：定高外环 -> 垂向加速度指令 a_h_cmd（带抗饱和）
+% - 姿态分配：优先用 alpha 满足"所需升力（CL_req）"，alpha 饱和时自动降低 a_h_cmd
+%   （避免高度环硬追导致 alpha 长期打死）
+% - 速度：阻力前馈 + PI 输出 CT_cmd，再反解 dT
 %
 % 依赖函数：
 % lla2ecef_cgcs2000, ecef2lla_cgcs2000, atmos_simple, aero_coeffs
@@ -30,6 +39,8 @@ omega_ie = [0;0;we];
 
 use_simple_gravity = true;
 use_rotation_terms = false;
+
+g0 = 9.80665;
 
 %% ===================== 飞行器参数 =====================
 m     = 671.33;
@@ -65,28 +76,39 @@ seg0_h = seg0 - dot(seg0,u_up0)*u_up0;
 if norm(seg0_h) < 1e-6, seg0_h = seg0; end
 v = V0 * seg0_h / norm(seg0_h);
 
-
 %% ===================== 控制参数 =====================
-% L1
+% L1（横向）
 L1_base  = 100e3;
 L1_gainV = 25;
 a_lat_max_cruise = 60;   % 巡航段
 a_lat_max_term   = 140;  % 末段增强
 
-% 纵向高度环
-Kph = 0.010; Kih = 0.00002; Kdh = 0.008;
-int_h = 0; int_h_lim = 8e4;
-a_h_max = 25;
+% ----------------- 定高（纵向） -----------------
+% 这里仍用"高度->垂向加速度"外环，但加入 alpha 饱和卸载（关键改动）
+% 如果你后续希望更"工程化"，可把高度环改成 h->gamma->a_n 的结构。
+h_cmd_cruise = 30e3;   % 30 km 常数定高（你要求）
 
-% alpha/phi 限幅（弧度）
+Kph = 0.010; 
+Kih = 0.00002; 
+Kdh = 0.008;
+int_h = 0; 
+int_h_lim = 8e4;
+a_h_max = 18;          % 巡航段垂向指令限幅建议更温和
+
+% alpha/phi 限幅（弧度）——按你要求收紧 alpha 上限到 1 deg
 phi_lim   = 65*pi/180;
 theta_lim = 35*pi/180;
 alpha_min = -2*pi/180;
-alpha_max = 18*pi/180;
+alpha_max =  1*pi/180;
+
+% alpha 饱和卸载强度（越大越"放弃高度去保alpha"）
+alpha_unload_gain = 0.85;
 
 % 速度控制（CT前馈+PI）
-Kpv = 0.0018; Kiv = 0.00025;
-int_v = 0; int_v_lim = 8e3;
+Kpv = 0.0018; 
+Kiv = 0.00025;
+int_v = 0; 
+int_v_lim = 8e3;
 
 CT_min = 0.05; CT_max = 0.1;
 dT_min = 0.10; dT_max = 1.00;
@@ -98,7 +120,7 @@ M_cmd_mid  = 6.5;
 M_cmd_near = 6.5;
 V_floor    = 1100;
 
-% 终端捕获参数
+% 终端捕获参数（保留原逻辑）
 R_hit            = 1000;    % 1 km 命中
 R_term1          = 120e3;   % 进入末段1
 R_term2          = 40e3;    % 进入末段2（更激进）
@@ -124,6 +146,12 @@ CTcmd_hist = nan(N_max,1);
 L1_hist = nan(N_max,1);
 alat_hist = nan(N_max,1);
 wp_idx_hist = nan(N_max,1);
+alpha_hist = nan(N_max,1);
+phi_hist   = nan(N_max,1);
+theta_hist = nan(N_max,1);
+T_hist     = nan(N_max,1);
+D_hist     = nan(N_max,1);
+L_hist     = nan(N_max,1);
 
 stop_reason = "completed";
 k = 1;
@@ -132,23 +160,12 @@ t_now = 0;
 prev_R = inf;
 min_R = inf;
 
-did_unit_check = false;
-
 %% ===================== 主循环 =====================
 while k <= N_max && t_now <= T_end
+
     % --- 当前地理量 ---
     % ecef2lla_cgcs2000 返回 lat/lon 单位：度（见函数内部 atan2d）
     [lat_deg, lon_deg, h] = ecef2lla_cgcs2000(r');
-
-    % % 自检：确认输出看起来像"度"
-    % if ~did_unit_check
-    %     did_unit_check = true;
-    %     if abs(lat_deg) <= pi && abs(lon_deg) <= pi
-    %         fprintf('[WARN] ecef2lla 输出看起来像弧度(lat=%.4f,lon=%.4f)，但本工程函数通常应输出度，请检查 ecef2lla_cgcs2000 实现。\n', lat_deg, lon_deg);
-    %     else
-    %         fprintf('[INFO] ecef2lla 输出单位判定为"度"(lat=%.3f deg, lon=%.3f deg)。\n', lat_deg, lon_deg);
-    %     end
-    % end
 
     if h <= 20e3
         stop_reason = "terrain impact";
@@ -235,7 +252,7 @@ while k <= N_max && t_now <= T_end
         n_xt = cross(u_up,t_h); n_xt = n_xt/max(norm(n_xt),1e-6);
     end
 
-    % 末段增强：缩L1, 增a_lat_max
+    % 末段增强：缩L1, 增a_lat_max（保持原逻辑）
     if R_to_T < R_term2
         L1_dist = max(8e3, 8*Vh);
         a_lat_max = a_lat_max_term;
@@ -262,9 +279,10 @@ while k <= N_max && t_now <= T_end
     right_h = cross(u_up,u_vh); right_h = right_h/max(norm(right_h),1e-6);
     a_lat_vec = a_lat_cmd * right_h;
 
-    %% ================= 纵向高度PID =================
-    [~,~,h_wp_next] = ecef2lla_cgcs2000(r_wp_next'); % h_wp_next 单位：m
-    h_cmd = h_wp_next;
+    %% ================= 定高（纵向） =================
+    % 巡航段：h_cmd 固定为 30 km
+    % 末段也仍可固定（你要求"巡航段"，此处全程固定更直接）
+    h_cmd = h_cmd_cruise;
 
     v_up = dot(v,u_up);
     h_err = h_cmd - h;
@@ -273,6 +291,8 @@ while k <= N_max && t_now <= T_end
     int_h = min(max(int_h,-int_h_lim),int_h_lim);
 
     a_h_cmd = Kph*h_err + Kih*int_h - Kdh*v_up;
+
+    % 末段可以稍放宽（可选）
     if R_to_T < R_term2
         a_h_lim_now = 1.2*a_h_max;
     else
@@ -284,31 +304,49 @@ while k <= N_max && t_now <= T_end
     a_cmd_ecef = a_lat_vec + a_vert_vec;
     a_cmd_norm = norm(a_cmd_ecef);
 
-    %% ================= a_cmd -> alpha/phi =================
-    CL_max = 2.8;  % 末段可略提
-    aL_cap = (CL_max*qbar*S_ref)/m;
-    if a_cmd_norm > aL_cap && a_cmd_norm > 1e-6
-        a_cmd_ecef = a_cmd_ecef * (aL_cap/a_cmd_norm);
-        a_cmd_norm = aL_cap;
+    %% ================= a_cmd -> alpha/phi（含alpha饱和卸载） =================
+    % 先算"理论需要的 CL_req"，反推 alpha_cmd
+    CL_req = (m*a_cmd_norm)/max(qbar*S_ref,1);
+
+    % 线性反推alpha（与 aero_coeffs 的 CL 拟合一致的近似斜率/截距）
+    adeg_est = 0.0; % 巡航小攻角附近
+    CL_alpha_rad = (0.07235 - 0.003368*Ma) * (180/pi);
+    CL_alpha_rad = max(CL_alpha_rad,0.1);
+    CL0_est = 0.1498 - 0.02751*Ma + 0.002343*Ma^2 + 0.001185*adeg_est^2;
+
+    alpha_cmd = (CL_req - CL0_est)/CL_alpha_rad;
+
+    % -------- alpha饱和卸载：如果 alpha 超限，则缩小纵向加速度指令 --------
+    alpha_sat = min(max(alpha_cmd, alpha_min), alpha_max);
+    if abs(alpha_cmd - alpha_sat) > 1e-9
+        % 计算超限比例并卸载 a_h_cmd（只卸载纵向，横向仍由L1保障）
+        over = abs(alpha_cmd - alpha_sat)/max(abs(alpha_max-alpha_min),1e-6);
+        unload = min(1.0, alpha_unload_gain * (0.2 + 3.0*over));  % 0~1
+        a_h_cmd = (1.0 - unload)*a_h_cmd;
+
+        % 同时做高度积分抗饱和：避免积分继续把a_h推到更大
+        int_h = int_h * (1.0 - 0.5*unload);
+
+        % 重新组合 a_cmd 并再次反推 alpha
+        a_vert_vec = a_h_cmd * u_up;
+        a_cmd_ecef = a_lat_vec + a_vert_vec;
+        a_cmd_norm = norm(a_cmd_ecef);
+
+        CL_req = (m*a_cmd_norm)/max(qbar*S_ref,1);
+        alpha_cmd = (CL_req - CL0_est)/CL_alpha_rad;
+        alpha_cmd = min(max(alpha_cmd, alpha_min), alpha_max);
+    else
+        alpha_cmd = alpha_sat;
     end
 
+    % 再根据需要的"横/纵加速度分量"分配滚转指令
+    % 这里用"加速度向量"直接求 phi_cmd（姿态直接可控的前提下足够）
     a_vert_req = dot(a_cmd_ecef,u_up);
     a_h_req_vec = a_cmd_ecef - a_vert_req*u_up;
     a_lat_req = dot(a_h_req_vec,right_h);
 
     phi_cmd = atan2(a_lat_req, max(abs(a_vert_req),1.0));
     phi_cmd = min(max(phi_cmd,-phi_lim),phi_lim);
-
-    CL_req = (m*a_cmd_norm)/max(qbar*S_ref,1);
-
-    % 线性反推alpha（与更新后 aero_coeffs 的 CL 拟合一致的近似斜率/截距）
-    adeg_est = 2.0;
-    CL_alpha_rad = (0.07235 - 0.003368*Ma) * (180/pi);
-    CL_alpha_rad = max(CL_alpha_rad,0.1);
-    CL0_est = 0.1498 - 0.02751*Ma + 0.002343*Ma^2 + 0.001185*adeg_est^2;
-
-    alpha_cmd = (CL_req - CL0_est)/CL_alpha_rad;
-    alpha_cmd = min(max(alpha_cmd,alpha_min),alpha_max);
 
     gamma_now = atan2(v_up, Vh);
     theta_cmd = gamma_now + alpha_cmd*cos(phi_cmd);
@@ -360,12 +398,11 @@ while k <= N_max && t_now <= T_end
     dT = dT + (dT_target - dT)*dt_use/tau_dT;
     dT = min(max(dT,dT_min),dT_max);
 
-    % 实际推力
+    % 实际推力系数
     [~,~,CT] = aero_coeffs(Ma, alpha_cmd, dT);
 
-
-    %% 推力太小调试
-    T_eng =5 * CT*qbar*S_ref;
+    % -------- 推力模型--------
+    T_eng = CT * qbar * S_ref;
 
     %% ================= 力与积分 =================
     if norm(v_h) > 1e-6
@@ -412,6 +449,12 @@ while k <= N_max && t_now <= T_end
     L1_hist(k) = L1_dist;
     alat_hist(k) = a_lat_cmd;
     wp_idx_hist(k) = wp_idx;
+    alpha_hist(k) = alpha_cmd;
+    phi_hist(k)   = phi_cmd;
+    theta_hist(k) = theta_cmd;
+    T_hist(k)     = T_eng;
+    D_hist(k)     = D;
+    L_hist(k)     = L;
 
     if any(~isfinite([r;v;Ma;qbar;CL;CD;CT;dT]))
         stop_reason = "NaN/Inf";
@@ -420,17 +463,11 @@ while k <= N_max && t_now <= T_end
     end
 
     k = k + 1;
-    
-    % if k < 100
-    % fprintf("t=%.2f h=%.0f V=%.0f rho=%.4f q=%.0f  CT=%.3f  T=%.0f  D=%.0f  L=%.0f  v_up=%.1f\n", ...
-    %     t_now, h, V, rho, qbar, CT, T_eng, D, L, v_up);
+
+    % if mod(round(t_now,1),1.0)==0
+    %     fprintf("t=%.0f h=%.0f v_up=%.1f  alpha=%.2fdeg  L/W=%.2f  (T-D)=%.0f\n", ...
+    %         t_now, h, v_up, alpha_cmd*180/pi, L/(m*g0), (T_eng-D));
     % end
-
-
-    if mod(round(t_now,1),1.0)==0
-    fprintf("t=%.0f h=%.0f v_up=%.1f  L/W=%.2f  (T-D)=%.0f\n", ...
-        t_now, h, v_up, L/(m*9.81), (T_eng-D));
-    end
 
 end
 
@@ -454,6 +491,12 @@ CTffk = CTff_hist(valid);
 CTcmdk = CTcmd_hist(valid);
 L1k = L1_hist(valid);
 alatk = alat_hist(valid);
+alphak = alpha_hist(valid);
+phik   = phi_hist(valid);
+thetak = theta_hist(valid);
+Tk     = T_hist(valid);
+Dforce = D_hist(valid);
+Lforce = L_hist(valid);
 
 fprintf('Simulation stop reason: %s, t=%.2f s, min range=%.1f m\n', stop_reason, tt(end), min(Dk));
 
@@ -461,7 +504,7 @@ fprintf('Simulation stop reason: %s, t=%.2f s, min range=%.1f m\n', stop_reason,
 figure;
 plot(tt, Dk/1000, 'm', 'LineWidth',1.7); grid on;
 xlabel('Time (s)'); ylabel('Distance to Target (km)');
-title('Distance to Target (Terminal Version)');
+title('Distance to Target');
 
 figure;
 plot(tt, Vck, 'b', 'LineWidth',1.4); grid on; yline(0,'r--');
@@ -476,9 +519,15 @@ title('Speed Tracking');
 legend('|V|','V_{cmd}','Location','best');
 
 figure;
-plot(tt, Hk/1000, 'LineWidth',1.4); grid on;
+plot(tt, Hk/1000, 'LineWidth',1.4); grid on; yline(h_cmd_cruise/1000,'r--');
 xlabel('Time (s)'); ylabel('Altitude (km)');
-title('Altitude');
+title('Altitude Hold');
+
+figure;
+plot(tt, alphak*180/pi, 'LineWidth',1.3); grid on;
+yline(alpha_min*180/pi,'r--'); yline(alpha_max*180/pi,'r--');
+xlabel('Time (s)'); ylabel('\alpha (deg)');
+title('Angle of Attack (limited)');
 
 figure;
 plot(tt, dTk, 'LineWidth',1.3); grid on;
@@ -511,8 +560,18 @@ title('L1 Distance Scheduling');
 
 figure;
 plot(tt, alatk, 'LineWidth',1.3); grid on;
-xlabel('Time (s))'); ylabel('a_{lat,cmd} (m/s^2)');
+xlabel('Time (s)'); ylabel('a_{lat,cmd} (m/s^2)');
 title('Lateral Acceleration Command');
+
+figure;
+plot(tt, Tk, 'LineWidth',1.3); grid on;
+xlabel('Time (s)'); ylabel('Thrust (N)');
+title('Engine Thrust (T = CT*q*S)');
+
+figure;
+plot(tt, (Tk - Dforce), 'LineWidth',1.3); grid on;
+xlabel('Time (s)'); ylabel('(T - D) (N)');
+title('Excess Thrust');
 
 figure;
 plot3(Rk(:,1)/1e3, Rk(:,2)/1e3, Rk(:,3)/1e3, 'b','LineWidth',1.3); hold on; grid on; axis equal;
@@ -520,7 +579,7 @@ plot3(Rk(:,1)/1e3, Rk(:,2)/1e3, Rk(:,3)/1e3, 'b','LineWidth',1.3); hold on; grid
 surf(Re*xe/1e3, Re*ye/1e3, Re*ze/1e3, 'FaceAlpha',0.08,'EdgeColor','none');
 plot3(rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'ro','MarkerFaceColor','r');
 xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
-title('Trajectory in ECEF (Terminal Version)');
+title('Trajectory in ECEF');
 legend('Vehicle','Earth','Target','Location','best');
 
 %% ===================== 绘图（发射系 ENU） =====================
@@ -567,17 +626,7 @@ xlabel('Longitude (deg)'); ylabel('Latitude (deg)');
 title('Trajectory Ground Track (Lat/Lon)');
 legend('Trajectory','Launch','Target','Location','best');
 
-% 若跨越日期变更线（±180°）导致折线"拉跨"，可用 unwrap 处理（单位：度）
-% lon_u = rad2deg(unwrap(deg2rad(lon_traj)));
-% figure; plot(lon_u, lat_traj, 'b', 'LineWidth', 1.5); grid on;
-% xlabel('Longitude (unwrapped, deg)'); ylabel('Latitude (deg)');
-% title('Trajectory Ground Track (Lat/Lon, unwrapped)');
-
-
 %% ===================== 轨迹经纬高(LLA)三维图 =====================
-% lat_traj / lon_traj / h_traj 已在上面由 ecef2lla_cgcs2000 计算得到
-% 注意：lat/lon 单位为"度"，h 单位为"m"
-
 figure;
 plot3(lon_traj, lat_traj, h_traj/1000, 'b', 'LineWidth', 1.5); grid on; hold on;
 plot3(lon0, lat0, h0/1000, 'go', 'MarkerFaceColor','g');   % 发射点
