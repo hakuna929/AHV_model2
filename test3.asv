@@ -77,7 +77,7 @@ if norm(seg0_h) < 1e-6, seg0_h = seg0; end
 u_vh0 = seg0_h / norm(seg0_h);
 
 %%%%%%%%%%%%%%%%%调试%%%%%%%%%%%%%%%%%%%%
-gamma0 = 2.2*pi/180;   % 建议先从 +1.2 deg 试；不够再到 +1.8~2.5 deg
+gamma0 = 1.2*pi/180;   % 建议先从 +1.2 deg 试；不够再到 +1.8~2.5 deg
 v = V0 * (cos(gamma0)*u_vh0 + sin(gamma0)*u_up0);
 % v = V0 * seg0_h / norm(seg0_h);
 
@@ -304,17 +304,6 @@ while k <= N_max && t_now <= T_end
         a_h_lim_now = a_h_max;
     end
     a_h_cmd = min(max(a_h_cmd,-a_h_lim_now),a_h_lim_now);
-
-    %%%%%%%%%%%%%%%%%%%%调试%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    % -------- 前200s高度保护：不允许掉到 29 km 以下 --------
-    h_floor_200 = 29e3;
-    t_protect   = 2;
-
-    if (t_now < t_protect) && (h < h_floor_200)
-        a_h_cmd = max(a_h_cmd, 0);     % 只允许向上（或至少不再向下）
-        int_h   = max(int_h, 0);       % 防止积分在地板附近把你继续往下拉
-    end
-
 
     a_vert_vec = a_h_cmd * u_up;
     a_cmd_ecef = a_lat_vec + a_vert_vec;
