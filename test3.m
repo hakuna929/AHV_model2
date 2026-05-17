@@ -99,7 +99,7 @@ a_h_max = 18;          % 巡航段垂向指令限幅建议更温和
 phi_lim   = 65*pi/180;
 theta_lim = 35*pi/180;
 alpha_min = -2*pi/180;
-alpha_max =  1*pi/180;
+alpha_max =  10*pi/180;
 
 % alpha 饱和卸载强度（越大越"放弃高度去保alpha"）
 alpha_unload_gain = 0.85;
