@@ -100,7 +100,7 @@ int_h = 0;
 int_h_lim = 8e4;
 a_h_max = 18;          % 巡航段垂向指令限幅建议更温和
 
-% alpha/phi 限幅（弧度）——按你要求收紧 alpha 上限到 1 deg
+% alpha/phi 限幅（弧度）——按你要求收紧 alpha 上限到 10 deg
 phi_lim   = 65*pi/180;
 theta_lim = 35*pi/180;
 alpha_min = -2*pi/180;
@@ -431,6 +431,28 @@ while k <= N_max && t_now <= T_end
     F_lift_e   =  L * u_up;
     F_thrust_e =  T_eng * fwd;
     F_ecef = F_drag_e + F_lift_e + F_thrust_e;
+
+    % % ---------- Lift direction that follows attitude (bank) ----------
+    % vhat = v / max(norm(v),1e-6);   % velocity direction
+    % 
+    % % "Up" direction in ECEF (radial up)
+    % u_up = r / norm(r);
+    % 
+    % % baseline lift direction: perpendicular to v, as upward as possible
+    % lift_ref = u_up - dot(u_up, vhat)*vhat;     % remove component along v
+    % lift_ref = lift_ref / max(norm(lift_ref),1e-6);
+    % 
+    % % rotate lift_ref about vhat by bank angle phi_cmd (Rodrigues)
+    % kk = vhat;
+    % c = cos(phi_cmd); s = sin(phi_cmd);
+    % lift_dir = lift_ref*c + cross(kk,lift_ref)*s + kk*dot(kk,lift_ref)*(1-c);
+    % lift_dir = lift_dir / max(norm(lift_dir),1e-6);
+    % 
+    % % forces
+    % F_drag_e   = -D * vhat;
+    % F_lift_e   =  L * lift_dir;
+    % F_thrust_e =  T_eng * fwd;
+    % F_ecef = F_drag_e + F_lift_e + F_thrust_e;
 
     if use_simple_gravity
         g_ecef = -mu/norm(r)^3 * r;
