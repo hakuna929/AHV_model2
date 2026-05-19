@@ -1,6 +1,4 @@
 % main_3dof_L1_terminal.m
-% 3DOFL1航线跟踪 + 定高/定速巡航 + 末段捕获增强（alpha严格限制版本）
-% ------------------------------------------------------------
 % 你提出的约束/假设：
 % 1) 姿态(phi/theta/psi)视为"直接可控量"（等价于内环完美跟踪）
 % 2) 巡航段高度保持：h_cmd = 30 km 常数
@@ -22,27 +20,23 @@
 
 clear; clc;
 
-%% ===================== 仿真时间 =====================
+%%  仿真时间 
 dt_base = 0.01;
 T_end   = 3000;
 N_max   = ceil(T_end/dt_base) * 5;  % 预留给末段小步长
 
-%% ===================== 常量 =====================
+%%  常量 
 mu  = 3.986004418e14;
 Re  = 6378137.0;
 we  = 7.2921150e-5;
 omega_ie = [0;0;we];
-
-use_simple_gravity = true;
-use_rotation_terms = false;
-
 g0 = 9.80665;
 
-%% ===================== 飞行器参数 =====================
+%%  飞行器参数设置 
 m     = 671.33;
 S_ref = 0.2986;
 
-%% ===================== 初始/目标 =====================
+%%  起点/终点设置 
 h0 = 30e3; lat0 = 19.2; lon0 = 110.5;   % lat/lon 单位：度
 r = lla2ecef_cgcs2000(lat0, lon0, h0); r = r(:);
 
@@ -52,7 +46,7 @@ rT = lla2ecef_cgcs2000(latT, lonT, hT); rT = rT(:);
 [a0,~] = atmos_simple(h0);
 V0 = 6.5 * a0;
 
-% 航点（可扩展）
+% 航点
 wps_lla = [lat0, lon0, h0;
            latT, lonT, hT];
 nWP = size(wps_lla,1);
@@ -63,32 +57,31 @@ end
 wp_idx = 2;
 r_wp_prev = wps_ecef(1,:)';
 r_wp_next = wps_ecef(2,:)';
-wp_switch_dist = 25e3;
+wp_switch_dist = 2e3;
 
-% 初始速度沿航段切向（水平）
+%% 初始速度方向设置
 u_up0 = r/norm(r);
+% seg0：起点指向目标的矢量
 seg0 = r_wp_next - r_wp_prev;
+% seg0水平分量
 seg0_h = seg0 - dot(seg0,u_up0)*u_up0;
 if norm(seg0_h) < 1e-6, seg0_h = seg0; end
+% 单位速度方向沿当前起点到目标点平飞
 u_vh0 = seg0_h / norm(seg0_h);
 
-%%%%%%%%%%%%%%%%%调试%%%%%%%%%%%%%%%%%%%%
-gamma0 = 0*pi/180;   % 初始配平建议水平飞行
-v = V0 * (cos(gamma0)*u_vh0 + sin(gamma0)*u_up0);
-% v = V0 * seg0_h / norm(seg0_h);
+%% 初始速度方向设置----待调试
+gamma0 = 0*pi/180;   % 弹道倾角（速度矢量与当地水平面之间夹角）
+% v = V0 * (cos(gamma0)*u_vh0 + sin(gamma0)*u_up0);
+v = V0 * seg0_h / norm(seg0_h);
 
-%% ===================== 控制参数 =====================
+%% 控制参数设置
 % L1（横向）
 L1_base  = 100e3;
 L1_gainV = 25;
 a_lat_max_cruise = 60;   % 巡航段
 a_lat_max_term   = 140;  % 末段增强
 
-% ----------------- 定高（纵向） -----------------
-% 这里仍用"高度->垂向加速度"外环，但加入 alpha 饱和卸载（关键改动）
-% 如果你后续希望更"工程化"，可把高度环改成 h->gamma->a_n 的结构。
-h_cmd_cruise = 30e3;   % 30 km 常数定高（你要求）
-
+%%  定高设置
 Kph = 0.020; 
 Kih = 0.00005; 
 Kdh = 0.012;
@@ -119,7 +112,7 @@ CT_min = 0.025; CT_max = 0.09;
 dT_min = 0.001; dT_max = 1.00;
 tau_dT = 0.3; dT = 0.5;
 
-%% ===================== 初始配平（自动） =====================
+%%  初始配平
 use_trim_init = true;
 if use_trim_init
     [a0, rho0] = atmos_simple(h0);
@@ -175,7 +168,7 @@ R_term2          = 40e3;    % 进入末段2（更激进）
 R_pass_check     = 20e3;    % 最近点判据启用距离
 R_abort_diverge  = 50e3;    % 若近距后发散可停
 
-%% ===================== 记录数组 =====================
+%% 记录数组 
 t_log = nan(N_max,1);
 Rhist = nan(N_max,3);
 Vhist = nan(N_max,3);
@@ -208,11 +201,11 @@ t_now = 0;
 prev_R = inf;
 min_R = inf;
 
-%% ===================== 主循环 =====================
+%%  主循环 
 while k <= N_max && t_now <= T_end
 
     % --- 当前地理量 ---
-    % ecef2lla_cgcs2000 返回 lat/lon 单位：度（见函数内部 atan2d）
+    % ecef2lla_cgcs2000 返回 lat/lon 单位：度
     [lat_deg, lon_deg, h] = ecef2lla_cgcs2000(r');
 
     if h <= 20e3
@@ -269,7 +262,7 @@ while k <= N_max && t_now <= T_end
     % --- 局部基 ---
     u_up = r / norm(r);
 
-    % lat/lon 为"度"，所以这里使用 sind/cosd
+    % lat/lon 为"度"
     eE = [-sind(lon_deg); cosd(lon_deg); 0];
     eN = [-sind(lat_deg)*cosd(lon_deg); -sind(lat_deg)*sind(lon_deg); cosd(lat_deg)];
 
@@ -327,9 +320,8 @@ while k <= N_max && t_now <= T_end
     right_h = cross(u_up,u_vh); right_h = right_h/max(norm(right_h),1e-6);
     a_lat_vec = a_lat_cmd * right_h;
 
-    %% ================= 定高（纵向） =================
+    %%  定高（纵向） 
     % 巡航段：h_cmd 固定为 30 km
-    % 末段也仍可固定（你要求"巡航段"，此处全程固定更直接）
     h_cmd = h_cmd_cruise;
 
     v_up = dot(v,u_up);
@@ -352,7 +344,7 @@ while k <= N_max && t_now <= T_end
     end
     a_h_cmd = min(max(a_h_cmd,-a_h_lim_now),a_h_lim_now);
 
-    %%%%%%%%%%%%%%%%%%%%调试%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% 调试
     % -------- 前200s高度保护：不允许掉到 29 km 以下 --------
     h_floor_200 = 29e3;
     t_protect   = 2;
@@ -366,8 +358,7 @@ while k <= N_max && t_now <= T_end
     a_cmd_ecef = a_lat_vec + a_vert_vec;
     a_cmd_norm = norm(a_cmd_ecef);
 
-    %% ================= a_cmd -> alpha/phi（含alpha饱和卸载） =================
-    % 先算"理论需要的 CL_req"，反推 alpha_cmd
+    %%  a_cmd -> alpha/phi
     CL_req = (m*a_cmd_norm)/max(qbar*S_ref,1);
 
     % 线性反推alpha（与 aero_coeffs 的 CL 拟合一致的近似斜率/截距）
@@ -378,7 +369,7 @@ while k <= N_max && t_now <= T_end
 
     alpha_cmd = (CL_req - CL0_est)/CL_alpha_rad;
 
-    % -------- alpha饱和卸载：如果 alpha 超限，则缩小纵向加速度指令 --------
+    % alpha饱和卸载：如果 alpha 超限，则缩小纵向加速度指令 
     alpha_sat = min(max(alpha_cmd, alpha_min), alpha_max);
     if abs(alpha_cmd - alpha_sat) > 1e-9
         % 计算超限比例并卸载 a_h_cmd（只卸载纵向，横向仍由L1保障）
@@ -401,8 +392,6 @@ while k <= N_max && t_now <= T_end
         alpha_cmd = alpha_sat;
     end
 
-    % 再根据需要的"横/纵加速度分量"分配滚转指令
-    % 这里用"加速度向量"直接求 phi_cmd（姿态直接可控的前提下足够）
     a_vert_req = dot(a_cmd_ecef,u_up);
     a_h_req_vec = a_cmd_ecef - a_vert_req*u_up;
     a_lat_req = dot(a_h_req_vec,right_h);
@@ -419,7 +408,7 @@ while k <= N_max && t_now <= T_end
 
     phi = phi_cmd; theta = theta_cmd; psi = psi_cmd;
 
-    %% ================= 速度控制（CT前馈+PI） =================
+    %%  速度控制（CT前馈+PI）
     if R_to_T > 900e3
         M_cmd = M_cmd_far;
     elseif R_to_T > 250e3
@@ -466,7 +455,7 @@ while k <= N_max && t_now <= T_end
     % -------- 推力模型--------
     T_eng = CT * qbar * S_ref;
 
-    %% ================= 力与积分 =================
+    %%  力与积分
     if norm(v_h) > 1e-6
         fwd = v_h / norm(v_h);
     else
@@ -478,21 +467,18 @@ while k <= N_max && t_now <= T_end
     F_thrust_e =  T_eng * fwd;
     F_ecef = F_drag_e + F_lift_e + F_thrust_e;
 
-    if use_simple_gravity
-        g_ecef = -mu/norm(r)^3 * r;
-    end
+    [lat_g, lon_g, h_g] = ecef2lla_cgcs2000(r');
+    g_ecef = gravity_cgcs2000_ecef(lat_g, lon_g, h_g);
 
-    if use_rotation_terms
-        a_ecef = g_ecef + F_ecef/m - 2*cross(omega_ie,v) - cross(omega_ie,cross(omega_ie,r));
-    else
-        a_ecef = g_ecef + F_ecef/m;
-    end
+    a_ecef = g_ecef + F_ecef/m ...
+         - 2*cross(omega_ie, v) ...
+         - cross(omega_ie, cross(omega_ie, r));
 
     v = v + a_ecef*dt_use;
     r = r + v*dt_use;
     t_now = t_now + dt_use;
 
-    %% ================= 记录 =================
+    %%  记录 
     t_log(k) = t_now;
     Rhist(k,:) = r.';
     Vhist(k,:) = v.';
@@ -527,7 +513,7 @@ while k <= N_max && t_now <= T_end
     k = k + 1;
 end
 
-%% ===================== 截断有效数据 =====================
+%%  截断有效数据 
 valid = isfinite(t_log) & isfinite(Dist_hist);
 tt = t_log(valid);
 
@@ -556,7 +542,7 @@ Lforce = L_hist(valid);
 
 fprintf('Simulation stop reason: %s, t=%.2f s, min range=%.1f m\n', stop_reason, tt(end), min(Dk));
 
-%% ===================== 绘图 =====================
+%%  绘图 
 figure;
 plot(tt, Dk/1000, 'm', 'LineWidth',1.7); grid on;
 xlabel('Time (s)'); ylabel('Distance to Target (km)');
@@ -638,7 +624,7 @@ xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
 title('Trajectory in ECEF');
 legend('Vehicle','Earth','Target','Location','best');
 
-%% ===================== 绘图（发射系 ENU） =====================
+%%  绘图（发射系 ENU） 
 % 参考点：发射点（初始点） lat0/lon0 为度
 r0 = lla2ecef_cgcs2000(lat0, lon0, h0).';
 r0 = r0(:);
@@ -664,7 +650,7 @@ plot3(E, N, U, 'b', 'LineWidth', 1.5); grid on; axis equal;
 xlabel('East (km)'); ylabel('North (km)'); zlabel('Up (km)');
 title('Trajectory in Launch Frame (ENU)');
 
-%% ---------- 轨迹经纬度图（地面投影 Lat/Lon） ----------
+%%  轨迹经纬度图（地面投影 Lat/Lon） 
 Ntraj = size(Rk,1);
 lat_traj = nan(Ntraj,1);
 lon_traj = nan(Ntraj,1);
@@ -682,7 +668,7 @@ xlabel('Longitude (deg)'); ylabel('Latitude (deg)');
 title('Trajectory Ground Track (Lat/Lon)');
 legend('Trajectory','Launch','Target','Location','best');
 
-%% ===================== 轨迹经纬高(LLA)三维图 =====================
+%% 轨迹经纬高(LLA)三维图
 figure;
 plot3(lon_traj, lat_traj, h_traj/1000, 'b', 'LineWidth', 1.5); grid on; hold on;
 plot3(lon0, lat0, h0/1000, 'go', 'MarkerFaceColor','g');   % 发射点
