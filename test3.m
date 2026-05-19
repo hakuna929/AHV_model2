@@ -3,10 +3,9 @@
 % ------------------------------------------------------------
 % 你提出的约束/假设：
 % 1) 姿态(phi/theta/psi)视为"直接可控量"（等价于内环完美跟踪）
-% 2) 巡航段高度保持：h_cmd = 30 km 常数（不再跟随航点高度）
-% 3) 超燃冲压/推力系数 CT 的推力模型中原来 "系数5" 仅为调试：现移除
-%    推力：T_eng = CT * qbar * S_ref   （若你有实际发动机标定，可再换成 T=CT*qS*...）
-% 4) 攻角限制：alpha ∈ [-2°, +1°]（巡航段推荐小攻角）
+% 2) 巡航段高度保持：h_cmd = 30 km 常数
+%    推力：T_eng = CT * qbar * S_ref   
+% 4) 攻角限制：alpha ∈ [-2°, +10°]
 %
 % 控制结构（适合高超声速巡航）：
 % - 横向：L1 航线跟踪 -> a_lat_cmd
@@ -17,11 +16,8 @@
 %
 % 依赖函数：
 % lla2ecef_cgcs2000, ecef2lla_cgcs2000, atmos_simple, aero_coeffs
-%
-% 注意：
-% - 本工程 lla2ecef_cgcs2000 输入 lat/lon 为"度"
+% lla2ecef_cgcs2000 输入 lat/lon 为"度"
 % - ecef2lla_cgcs2000 输出 lat/lon 为"度"
-% - 因此在本脚本中，凡是对 lat/lon 做三角函数运算，一律使用 sind/cosd
 % - 姿态/alpha/phi/theta 等仍使用"弧度"
 
 clear; clc;
@@ -77,7 +73,7 @@ if norm(seg0_h) < 1e-6, seg0_h = seg0; end
 u_vh0 = seg0_h / norm(seg0_h);
 
 %%%%%%%%%%%%%%%%%调试%%%%%%%%%%%%%%%%%%%%
-gamma0 = 2.2*pi/180;   % 建议先从 +1.2 deg 试；不够再到 +1.8~2.5 deg
+gamma0 = 0*pi/180;   % 初始配平建议水平飞行
 v = V0 * (cos(gamma0)*u_vh0 + sin(gamma0)*u_up0);
 % v = V0 * seg0_h / norm(seg0_h);
 
@@ -93,12 +89,16 @@ a_lat_max_term   = 140;  % 末段增强
 % 如果你后续希望更"工程化"，可把高度环改成 h->gamma->a_n 的结构。
 h_cmd_cruise = 30e3;   % 30 km 常数定高（你要求）
 
-Kph = 0.010; 
-Kih = 0.00002; 
-Kdh = 0.008;
+Kph = 0.020; 
+Kih = 0.00005; 
+Kdh = 0.012;
 int_h = 0; 
 int_h_lim = 8e4;
 a_h_max = 18;          % 巡航段垂向指令限幅建议更温和
+
+% 重力前馈（保证 h_err=0 时仍有保持高度的升力需求）
+use_gravity_ff = true;
+a_h_bias = 1.2*g0;
 
 % alpha/phi 限幅（弧度）——按你要求收紧 alpha 上限到 10 deg
 phi_lim   = 65*pi/180;
@@ -107,7 +107,7 @@ alpha_min = -2*pi/180;
 alpha_max =  10*pi/180;
 
 % alpha 饱和卸载强度（越大越"放弃高度去保alpha"）
-alpha_unload_gain = 0.85;
+alpha_unload_gain = 0.1;
 
 % 速度控制（CT前馈+PI）
 Kpv = 0.0018; 
@@ -115,9 +115,52 @@ Kiv = 0.00025;
 int_v = 0; 
 int_v_lim = 8e3;
 
-CT_min = 0.05; CT_max = 0.1;
-dT_min = 0.10; dT_max = 1.00;
+CT_min = 0.025; CT_max = 0.09;
+dT_min = 0.001; dT_max = 1.00;
 tau_dT = 0.3; dT = 0.5;
+
+%% ===================== 初始配平（自动） =====================
+use_trim_init = true;
+if use_trim_init
+    [a0, rho0] = atmos_simple(h0);
+    Ma0   = V0 / max(a0,1e-3);
+    qbar0 = 0.5 * rho0 * V0^2;
+
+    % 需要的升力系数
+    CL_req0 = m*g0 / max(qbar0*S_ref,1);
+
+    % 在可用攻角范围内搜索配平 alpha
+    alpha_trim_min = -5*pi/180;
+    alpha_trim_max = 10*pi/180;
+    alpha0 = fminbnd(@(a) (getCL(Ma0, a, dT) - CL_req0).^2, ...
+                     alpha_trim_min, alpha_trim_max);
+
+    % 用 trim alpha 估算阻力 -> 需要推力系数
+    [CL0, CD0, ~] = aero_coeffs(Ma0, alpha0, dT);
+    D0 = CD0 * qbar0 * S_ref;
+    CT_req0 = D0 / max(qbar0*S_ref,1);
+
+    % 反解 dT
+    dT_grid = linspace(dT_min, dT_max, 41);
+    CT_grid = zeros(size(dT_grid));
+    for ii=1:numel(dT_grid)
+        [~,~,CT_grid(ii)] = aero_coeffs(Ma0, alpha0, dT_grid(ii));
+    end
+    [~,ix] = min(abs(CT_grid - CT_req0));
+    dT = dT_grid(ix);
+
+    % 初始姿态（用于记录/调试）
+    eE0 = [-sind(lon0); cosd(lon0); 0];
+    eN0 = [-sind(lat0)*cosd(lon0); -sind(lat0)*sind(lon0); cosd(lat0)];
+    chi0 = atan2(dot(u_vh0,eE0), dot(u_vh0,eN0));
+
+    phi0   = 0;
+    theta0 = gamma0 + alpha0;
+    psi0   = chi0;
+
+    fprintf('Trim init: alpha0=%.3f deg, dT0=%.3f, theta0=%.3f deg\n', ...
+            alpha0*180/pi, dT, theta0*180/pi);
+end
 
 % 马赫指令
 M_cmd_far  = 6.5;
@@ -295,7 +338,11 @@ while k <= N_max && t_now <= T_end
     int_h = int_h + h_err*dt_use;
     int_h = min(max(int_h,-int_h_lim),int_h_lim);
 
-    a_h_cmd = Kph*h_err + Kih*int_h - Kdh*v_up;
+    if use_gravity_ff
+        a_h_cmd = Kph*h_err + Kih*int_h - Kdh*v_up + a_h_bias;
+    else
+        a_h_cmd = Kph*h_err + Kih*int_h - Kdh*v_up;
+    end
 
     % 末段可以稍放宽（可选）
     if R_to_T < R_term2
@@ -314,7 +361,6 @@ while k <= N_max && t_now <= T_end
         a_h_cmd = max(a_h_cmd, 0);     % 只允许向上（或至少不再向下）
         int_h   = max(int_h, 0);       % 防止积分在地板附近把你继续往下拉
     end
-
 
     a_vert_vec = a_h_cmd * u_up;
     a_cmd_ecef = a_lat_vec + a_vert_vec;
@@ -432,28 +478,6 @@ while k <= N_max && t_now <= T_end
     F_thrust_e =  T_eng * fwd;
     F_ecef = F_drag_e + F_lift_e + F_thrust_e;
 
-    % % ---------- Lift direction that follows attitude (bank) ----------
-    % vhat = v / max(norm(v),1e-6);   % velocity direction
-    % 
-    % % "Up" direction in ECEF (radial up)
-    % u_up = r / norm(r);
-    % 
-    % % baseline lift direction: perpendicular to v, as upward as possible
-    % lift_ref = u_up - dot(u_up, vhat)*vhat;     % remove component along v
-    % lift_ref = lift_ref / max(norm(lift_ref),1e-6);
-    % 
-    % % rotate lift_ref about vhat by bank angle phi_cmd (Rodrigues)
-    % kk = vhat;
-    % c = cos(phi_cmd); s = sin(phi_cmd);
-    % lift_dir = lift_ref*c + cross(kk,lift_ref)*s + kk*dot(kk,lift_ref)*(1-c);
-    % lift_dir = lift_dir / max(norm(lift_dir),1e-6);
-    % 
-    % % forces
-    % F_drag_e   = -D * vhat;
-    % F_lift_e   =  L * lift_dir;
-    % F_thrust_e =  T_eng * fwd;
-    % F_ecef = F_drag_e + F_lift_e + F_thrust_e;
-
     if use_simple_gravity
         g_ecef = -mu/norm(r)^3 * r;
     end
@@ -501,12 +525,6 @@ while k <= N_max && t_now <= T_end
     end
 
     k = k + 1;
-
-    % if mod(round(t_now,1),1.0)==0
-    %     fprintf("t=%.0f h=%.0f v_up=%.1f  alpha=%.2fdeg  L/W=%.2f  (T-D)=%.0f\n", ...
-    %         t_now, h, v_up, alpha_cmd*180/pi, L/(m*g0), (T_eng-D));
-    % end
-
 end
 
 %% ===================== 截断有效数据 =====================
@@ -683,3 +701,8 @@ xlabel('Longitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Longitude
 subplot(2,1,2);
 plot(lat_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
 xlabel('Latitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Latitude');
+
+%% ====== local function ======
+function CL = getCL(Ma, alpha, dT)
+    [CL,~,~] = aero_coeffs(Ma, alpha, dT);
+end
