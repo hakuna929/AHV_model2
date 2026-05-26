@@ -2,7 +2,7 @@
 clear; clc; close all;
 
 Ma_list = [5 5.5 6 6.5 7];
-dT_list = [0.3 0.8];
+dT_list = [0.3 0.6 0.8];
 
 adeg = (-2:0.05:10)';   % deg
 alpha_label = '\alpha (deg)';
@@ -128,7 +128,7 @@ end
 
 
 %% -------- Figure: CT vs dT at fixed alpha=0 deg --------
-alpha0 = -2;                 % fixed alpha (deg)
+alpha0 = 4;                 % fixed alpha (deg)
 dT_sweep = (0.6:0.01:1)';     % dT range, adjust if needed
 
 CT_dT = zeros(numel(dT_sweep), numel(Ma_list));

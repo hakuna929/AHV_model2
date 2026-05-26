@@ -21,21 +21,22 @@ omega_ie = [0;0;we];
 g0 = 9.80665;
 
 %% ================= 飞行器参数 =================
-m_struct = 571.33;   % 结构质量 kg
-m_fuel0  = 100.0;    % 初始燃料质量 kg
-m_fuel   = m_fuel0;
-m        = m_struct + m_fuel;
+% m_struct = 571.33;   % 结构质量 kg
+% m_fuel0  = 100.0;    % 初始燃料质量 kg
+% m_fuel   = m_fuel0;
+% m        = m_struct + m_fuel;
+m = 671.33;
 
 S_ref = 0.2986;
 
 %% ================= 质量消耗模型参数 =================
 % 公式中 H 采用 km
 % 公式中 alpha 这里默认采用 deg
-mass_model_alpha_in_deg = true;
+% mass_model_alpha_in_deg = true;
 
 % 质量流量限幅，避免数值异常
-mdot_min = 0.0;     % kg/s
-mdot_max = 0.9;    % kg/s
+% mdot_min = 0.0;     % kg/s
+% mdot_max = 0.4;    % kg/s
 
 %% ================= 起点/终点设置 =================
 h0 = 30e3; lat0 = 19.2; lon0 = 110.5;   % lat/lon 单位：度
@@ -58,7 +59,7 @@ end
 wp_idx = 2;
 r_wp_prev = wps_ecef(1,:)';
 r_wp_next = wps_ecef(2,:)';
-wp_switch_dist = 2e3;
+wp_switch_dist = 100e3;
 
 %% ================= 初始速度方向设置 =================
 u_up0 = r/norm(r);
@@ -92,8 +93,8 @@ a_h_bias = 1.2*g0;
 
 phi_lim   = 65*pi/180;
 theta_lim = 35*pi/180;
-alpha_min = -2*pi/180;
-alpha_max =  10*pi/180;
+alpha_min = -2;
+alpha_max =  10;
 
 alpha_unload_gain = 0.1;
 
@@ -105,7 +106,7 @@ int_v_lim = 8e3;
 
 CT_min = 0.025;
 CT_max = 0.09;
-dT_min = 0.001;
+dT_min = 0.01;
 dT_max = 1.00;
 tau_dT = 0.3;
 dT = 0.5;
@@ -119,10 +120,10 @@ if use_trim_init
 
     CL_req0 = m*g0 / max(qbar0*S_ref,1);
 
-    alpha_trim_min = -5*pi/180;
-    alpha_trim_max = 10*pi/180;
-    alpha0 = fminbnd(@(a) (getCL(Ma0, a, dT) - CL_req0).^2, ...
-                     alpha_trim_min, alpha_trim_max);
+    alpha_trim_min = -2;
+    alpha_trim_max = 10;
+   alpha0 = fminbnd(@(a) (getCL(Ma0, a, dT) - CL_req0).^2, ...
+                 alpha_trim_min, alpha_trim_max);
 
     [~, CD0, ~] = aero_coeffs(Ma0, alpha0, dT);
     D0 = CD0 * qbar0 * S_ref;
@@ -144,8 +145,8 @@ if use_trim_init
     theta0 = gamma0 + alpha0;
     psi0   = chi0;
 
-    fprintf('Trim init: alpha0=%.3f deg, dT0=%.3f, theta0=%.3f deg\n', ...
-            alpha0*180/pi, dT, theta0*180/pi);
+   fprintf('Trim init: alpha0=%.3f deg, dT0=%.3f, theta0=%.3f deg\n', ...
+        alpha0, dT, theta0*180/pi);
 end
 
 %% ================= 马赫指令 =================
@@ -346,11 +347,11 @@ while k <= N_max && t_now <= T_end
     CL_req = (m*a_cmd_norm)/max(qbar*S_ref,1);
 
     adeg_est = 0.0;
-    CL_alpha_rad = (0.07235 - 0.003368*Ma) * (180/pi);
-    CL_alpha_rad = max(CL_alpha_rad,0.1);
+    CL_alpha_deg = (0.07235 - 0.003368*Ma) * (pi/180);
+    CL_alpha_deg = max(CL_alpha_deg,0.1);
     CL0_est = 0.1498 - 0.02751*Ma + 0.002343*Ma^2 + 0.001185*adeg_est^2;
 
-    alpha_cmd = (CL_req - CL0_est)/CL_alpha_rad;
+    alpha_cmd = (CL_req - CL0_est)/CL_alpha_deg;
     alpha_sat = min(max(alpha_cmd, alpha_min), alpha_max);
 
     if abs(alpha_cmd - alpha_sat) > 1e-9
@@ -364,7 +365,7 @@ while k <= N_max && t_now <= T_end
         a_cmd_norm = norm(a_cmd_ecef);
 
         CL_req = (m*a_cmd_norm)/max(qbar*S_ref,1);
-        alpha_cmd = (CL_req - CL0_est)/CL_alpha_rad;
+        alpha_cmd = (CL_req - CL0_est)/CL_alpha_deg;
         alpha_cmd = min(max(alpha_cmd, alpha_min), alpha_max);
     else
         alpha_cmd = alpha_sat;
@@ -430,15 +431,15 @@ while k <= N_max && t_now <= T_end
     T_eng = CT * qbar * S_ref;
 
     %% ================= 质量更新（正式调用独立函数） =================
-    [m, m_fuel, mdot_f] = update_mass_model( ...
-        m_struct, m_fuel, Ma, alpha_cmd, 0.0, h/1000, dT, dt_use, ...
-        mass_model_alpha_in_deg, mdot_min, mdot_max);
-
-    if m <= m_struct
-        m = m_struct;
-        m_fuel = 0;
-        mdot_f = 0;
-    end
+    % [m, m_fuel, mdot_f] = update_mass_model( ...
+    %     m_struct, m_fuel, Ma, alpha_cmd, 0.0, h/1000, dT, dt_use, ...
+    %     mass_model_alpha_in_deg, mdot_min, mdot_max);
+    % 
+    % if m <= m_struct
+    %     m = m_struct;
+    %     m_fuel = 0;
+    %     mdot_f = 0;
+    % end
 
     %% ================= 力与积分 =================
     if norm(v_h) > 1e-6
@@ -488,15 +489,15 @@ while k <= N_max && t_now <= T_end
     T_hist(k)     = T_eng;
     D_hist(k)     = D;
     L_hist(k)     = L;
-    m_hist(k)     = m;
-    mf_hist(k)    = m_fuel;
-    mdot_hist(k)  = mdot_f;
+    % m_hist(k)     = m;
+    % mf_hist(k)    = m_fuel;
+    % mdot_hist(k)  = mdot_f;
 
-    if any(~isfinite([r;v;Ma;qbar;CL;CD;CT;dT;m;m_fuel;mdot_f]))
-        stop_reason = "NaN/Inf";
-        fprintf('NaN/Inf at t=%.2f s\n', t_now);
-        break;
-    end
+    % if any(~isfinite([r;v;Ma;qbar;CL;CD;CT;dT;m;m_fuel;mdot_f]))
+    %     stop_reason = "NaN/Inf";
+    %     fprintf('NaN/Inf at t=%.2f s\n', t_now);
+    %     break;
+    % end
 
     k = k + 1;
 end
@@ -527,51 +528,51 @@ thetak = theta_hist(valid);
 Tk     = T_hist(valid);
 Dforce = D_hist(valid);
 Lforce = L_hist(valid);
-mk     = m_hist(valid);
-mfk    = mf_hist(valid);
-mdotk  = mdot_hist(valid);
+% mk     = m_hist(valid);
+% mfk    = mf_hist(valid);
+% mdotk  = mdot_hist(valid);
 
 fprintf('Simulation stop reason: %s, t=%.2f s, min range=%.1f m\n', stop_reason, tt(end), min(Dk));
 
 %% ================= 绘图 =================
-figure;
-plot(tt, Dk/1000, 'm', 'LineWidth',1.7); grid on;
-xlabel('Time (s)'); ylabel('Distance to Target (km)');
-title('Distance to Target');
+% figure;
+% plot(tt, Dk/1000, 'm', 'LineWidth',1.7); grid on;
+% xlabel('Time (s)'); ylabel('Distance to Target (km)');
+% title('Distance to Target');
 
-figure;
-plot(tt, Vck, 'b', 'LineWidth',1.4); grid on; yline(0,'r--');
-xlabel('Time (s)'); ylabel('V_c toward target (m/s)');
-title('Closing Speed');
+% figure;
+% plot(tt, Vck, 'b', 'LineWidth',1.4); grid on; yline(0,'r--');
+% xlabel('Time (s)'); ylabel('V_c toward target (m/s)');
+% title('Closing Speed');
 
 figure;
 plot(tt, Vmk, 'k', 'LineWidth',1.4); hold on; grid on;
 plot(tt, Vcmdk, 'r--', 'LineWidth',1.2);
 xlabel('Time (s)'); ylabel('Speed (m/s)');
-title('Speed Tracking');
+title('速度跟踪');
 legend('|V|','V_{cmd}','Location','best');
 
 figure;
 plot(tt, Hk/1000, 'LineWidth',1.4); grid on; yline(30,'r--');
 xlabel('Time (s)'); ylabel('Altitude (km)');
-title('Altitude Hold');
+title('高度保持');
 
 figure;
-plot(tt, alphak*180/pi, 'LineWidth',1.3); grid on;
-yline(alpha_min*180/pi,'r--'); yline(alpha_max*180/pi,'r--');
+plot(tt, alphak, 'LineWidth',1.3); grid on;
+yline(alpha_min,'r--'); yline(alpha_max,'r--');
 xlabel('Time (s)'); ylabel('\alpha (deg)');
-title('Angle of Attack (limited)');
+title('攻角');
 
 figure;
 plot(tt, dTk, 'LineWidth',1.3); grid on;
 xlabel('Time (s)'); ylabel('dT');
-title('Throttle');
+title('油门开度');
 
 figure;
 plot(tt, CTffk, 'b--', 'LineWidth',1.2); hold on; grid on;
 plot(tt, CTcmdk, 'r-', 'LineWidth',1.2);
 xlabel('Time (s)'); ylabel('C_T');
-title('CT Feedforward / CT Command');
+title('CT 前馈 / CT 指令');
 legend('CT_{ff}','CT_{cmd}','Location','best');
 
 figure;
@@ -583,52 +584,52 @@ figure;
 plot(tt, CLk, 'b', 'LineWidth',1.2); hold on; grid on;
 plot(tt, CDk, 'r--', 'LineWidth',1.2);
 xlabel('Time (s)'); ylabel('Coefficient');
-title('C_L / C_D');
+title('升阻比');
 legend('C_L','C_D','Location','best');
 
 figure;
 plot(tt, L1k/1000, 'LineWidth',1.3); grid on;
 xlabel('Time (s)'); ylabel('L1 distance (km)');
-title('L1 Distance Scheduling');
+title('L1距离');
 
 figure;
 plot(tt, alatk, 'LineWidth',1.3); grid on;
 xlabel('Time (s)'); ylabel('a_{lat,cmd} (m/s^2)');
-title('Lateral Acceleration Command');
+title('侧向加速度指令');
 
 figure;
 plot(tt, Tk, 'LineWidth',1.3); grid on;
 xlabel('Time (s)'); ylabel('Thrust (N)');
-title('Engine Thrust');
+title('发动机推力');
 
-figure;
-plot(tt, (Tk - Dforce), 'LineWidth',1.3); grid on;
-xlabel('Time (s)'); ylabel('(T - D) (N)');
-title('Excess Thrust');
+% figure;
+% plot(tt, (Tk - Dforce), 'LineWidth',1.3); grid on;
+% xlabel('Time (s)'); ylabel('(T - D) (N)');
+% title('Excess Thrust');
 
-figure;
-plot(tt, mk, 'LineWidth',1.3); grid on;
-xlabel('Time (s)'); ylabel('Mass (kg)');
-title('Total Mass');
+% figure;
+% plot(tt, mk, 'LineWidth',1.3); grid on;
+% xlabel('Time (s)'); ylabel('Mass (kg)');
+% title('Total Mass');
 
-figure;
-plot(tt, mfk, 'LineWidth',1.3); grid on;
-xlabel('Time (s)'); ylabel('Fuel Mass (kg)');
-title('Fuel Mass');
+% figure;
+% plot(tt, mfk, 'LineWidth',1.3); grid on;
+% xlabel('Time (s)'); ylabel('Fuel Mass (kg)');
+% title('Fuel Mass');
 
-figure;
-plot(tt, mdotk, 'LineWidth',1.3); grid on;
-xlabel('Time (s)'); ylabel('Fuel Mass Flow (kg/s)');
-title('Fuel Mass Flow');
+% figure;
+% plot(tt, mdotk, 'LineWidth',1.3); grid on;
+% xlabel('Time (s)'); ylabel('Fuel Mass Flow (kg/s)');
+% title('燃料消耗');
 
-figure;
-plot3(Rk(:,1)/1e3, Rk(:,2)/1e3, Rk(:,3)/1e3, 'b','LineWidth',1.3); hold on; grid on; axis equal;
-[xe,ye,ze] = sphere(60);
-surf(Re*xe/1e3, Re*ye/1e3, Re*ze/1e3, 'FaceAlpha',0.08,'EdgeColor','none');
-plot3(rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'ro','MarkerFaceColor','r');
-xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
-title('Trajectory in ECEF');
-legend('Vehicle','Earth','Target','Location','best');
+% figure;
+% plot3(Rk(:,1)/1e3, Rk(:,2)/1e3, Rk(:,3)/1e3, 'b','LineWidth',1.3); hold on; grid on; axis equal;
+% [xe,ye,ze] = sphere(60);
+% surf(Re*xe/1e3, Re*ye/1e3, Re*ze/1e3, 'FaceAlpha',0.08,'EdgeColor','none');
+% plot3(rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'ro','MarkerFaceColor','r');
+% xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
+% title('Trajectory in ECEF');
+% legend('Vehicle','Earth','Target','Location','best');
 
 %% ================= 绘图（发射系 ENU） =================
 r0 = lla2ecef_cgcs2000(lat0, lon0, h0).';
@@ -651,7 +652,7 @@ U = enu(3,:)/1e3;
 figure;
 plot3(E, N, U, 'b', 'LineWidth', 1.5); grid on; axis equal;
 xlabel('East (km)'); ylabel('North (km)'); zlabel('Up (km)');
-title('Trajectory in Launch Frame (ENU)');
+title('发射系下轨迹 (ENU)');
 
 %% ================= 轨迹经纬度图 =================
 Ntraj = size(Rk,1);
@@ -663,31 +664,31 @@ for ii = 1:Ntraj
     [lat_traj(ii), lon_traj(ii), h_traj(ii)] = ecef2lla_cgcs2000(Rk(ii,:));
 end
 
-figure;
-plot(lon_traj, lat_traj, 'b', 'LineWidth', 1.5); grid on; hold on;
-plot(lon0, lat0, 'go', 'MarkerFaceColor','g');
-plot(lonT, latT, 'ro', 'MarkerFaceColor','r');
-xlabel('Longitude (deg)'); ylabel('Latitude (deg)');
-title('Trajectory Ground Track (Lat/Lon)');
-legend('Trajectory','Launch','Target','Location','best');
+% figure;
+% plot(lon_traj, lat_traj, 'b', 'LineWidth', 1.5); grid on; hold on;
+% plot(lon0, lat0, 'go', 'MarkerFaceColor','g');
+% plot(lonT, latT, 'ro', 'MarkerFaceColor','r');
+% xlabel('Longitude (deg)'); ylabel('Latitude (deg)');
+% title('Trajectory Ground Track (Lat/Lon)');
+% legend('Trajectory','Launch','Target','Location','best');
 
 figure;
 plot3(lon_traj, lat_traj, h_traj/1000, 'b', 'LineWidth', 1.5); grid on; hold on;
 plot3(lon0, lat0, h0/1000, 'go', 'MarkerFaceColor','g');
 plot3(lonT, latT, hT/1000, 'ro', 'MarkerFaceColor','r');
 xlabel('Longitude (deg)'); ylabel('Latitude (deg)'); zlabel('Altitude (km)');
-title('Trajectory in LLA (Lon-Lat-Alt)');
+title('经纬高轨迹 LLA (Lon-Lat-Alt)');
 legend('Trajectory','Launch','Target','Location','best');
 view(3);
 
-figure;
-subplot(2,1,1);
-plot(lon_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
-xlabel('Longitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Longitude');
-
-subplot(2,1,2);
-plot(lat_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
-xlabel('Latitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Latitude');
+% figure;
+% subplot(2,1,1);
+% plot(lon_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
+% xlabel('Longitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Longitude');
+% 
+% subplot(2,1,2);
+% plot(lat_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
+% xlabel('Latitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Latitude');
 
 %% ================= local functions =================
 function CL = getCL(Ma, alpha, dT)

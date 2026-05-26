@@ -139,7 +139,7 @@ if use_trim_init
 
     CL_req0 = m*g0 / max(qbar0*S_ref,1);
 
-    alpha_trim_min = -5*pi/180;
+    alpha_trim_min = -2*pi/180;
     alpha_trim_max = 10*pi/180;
     alpha0 = fminbnd(@(a) (getCL(Ma0, a, dT) - CL_req0).^2, ...
                      alpha_trim_min, alpha_trim_max);
