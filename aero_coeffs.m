@@ -7,7 +7,9 @@ function [CL, CD, CT] = aero_coeffs(Ma, alpha, dT)
 %   CL,CD,CT 参与3DOF平动
 
     %% -------- 单位转换 --------
-    adeg = alpha * 180/pi;
+    % adeg = alpha * 180/pi;
+    adeg = alpha;
+
 
     %% -------- 输入限幅（数值稳定）--------
     Ma   = min(max(Ma,   0.0), 8.0);

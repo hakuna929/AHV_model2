@@ -7,7 +7,7 @@ clear; clc;
 
 %% ================= 仿真时间 =================
 dt_base = 0.01;
-T_end   = 3000;
+T_end   = 2000;
 N_max   = ceil(T_end/dt_base) * 5;  % 预留给末段小步长
 
 %% ================= 常量 =================
@@ -18,22 +18,9 @@ omega_ie = [0;0;we];
 g0 = 9.80665;
 
 %% ================= 飞行器参数 =================
-% m_struct = 571.33;   % 结构质量 kg
-% m_fuel0  = 100.0;    % 初始燃料质量 kg
-% m_fuel   = m_fuel0;
-% m        = m_struct + m_fuel;
 m = 671.33;
-
 S_ref = 0.2986;
 
-%% ================= 质量消耗模型参数 =================
-% 公式中 H 采用 km
-% 公式中 alpha 这里默认采用 deg
-% mass_model_alpha_in_deg = true;
-
-% 质量流量限幅，避免数值异常
-% mdot_min = 0.0;     % kg/s
-% mdot_max = 0.4;    % kg/s
 
 %% ================= 起点/终点设置 =================
 h0 = 30e3; lat0 = 19.2; lon0 = 110.5;   % lat/lon 单位：度
@@ -78,7 +65,7 @@ a_lat_max_cruise = 60;
 a_lat_max_term   = 140;
 
 % 定高
-Kph = 0.020;
+Kph = 0.010;
 Kih = 0.00005;
 Kdh = 0.012;
 int_h = 0;
@@ -115,12 +102,14 @@ if use_trim_init
     Ma0   = V0 / max(a0,1e-3);
     qbar0 = 0.5 * rho0 * V0^2;
 
-    CL_req0 = m*g0 / max(qbar0*S_ref,1);
+    R0 = 6371000;   % 地球半径 m
+    g = g0 * (R0/(R0+h0))^2;
+    CL_req0 = m*g / (qbar0*S_ref);
+    % CL_req0 = m*g0 / max(qbar0*S_ref,1);
 
     alpha_trim_min = -2;
     alpha_trim_max = 10;
-   alpha0 = fminbnd(@(a) (getCL(Ma0, a, dT) - CL_req0).^2, ...
-                 alpha_trim_min, alpha_trim_max);
+   alpha0 = fminbnd(@(a) (aero_coeffs(Ma0, a, dT) - CL_req0)^2, alpha_trim_min, alpha_trim_max);
 
     [~, CD0, ~] = aero_coeffs(Ma0, alpha0, dT);
     D0 = CD0 * qbar0 * S_ref;
