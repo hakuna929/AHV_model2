@@ -1,10 +1,7 @@
-% main_3dof_L1_terminal.m
-% 加入燃料质量消耗模型，并修正若干逻辑问题
-%
 % 依赖函数：
 % lla2ecef_cgcs2000, ecef2lla_cgcs2000, atmos_simple, aero_coeffs, gravity_cgcs2000_ecef
 % 其中 lla2ecef_cgcs2000 / ecef2lla_cgcs2000 的输入输出角度单位均为"度"
-% 本脚本内 alpha/phi/theta/psi 等仍使用"弧度"
+% 本脚本内 phi/theta/psi 使用"弧度" alpha使用角度
 
 clear; clc;
 
@@ -142,7 +139,7 @@ if use_trim_init
     chi0 = atan2(dot(u_vh0,eE0), dot(u_vh0,eN0));
 
     phi0   = 0;
-    theta0 = gamma0 + alpha0;
+    theta0 = gamma0 + deg2rad(alpha0);
     psi0   = chi0;
 
    fprintf('Trim init: alpha0=%.3f deg, dT0=%.3f, theta0=%.3f deg\n', ...
