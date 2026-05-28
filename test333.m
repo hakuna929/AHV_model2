@@ -34,7 +34,7 @@ V0 = 6.5 * a0;
 
 % 航点
 wps_lla = [lat0, lon0, h0;
-           latT, lonT, hT];
+    latT, lonT, hT];
 nWP = size(wps_lla,1);
 wps_ecef = zeros(nWP,3);
 for i=1:nWP
@@ -80,7 +80,7 @@ theta_lim = 35*pi/180;
 alpha_min = -2;
 alpha_max =  10;
 
-alpha_unload_gain = 0.1;
+alpha_unload_gain = 0;
 
 % 速度控制
 Kpv = 0.0018;
@@ -89,7 +89,7 @@ int_v = 0;
 int_v_lim = 8e3;
 
 CT_min = 0.025;
-CT_max = 0.09;
+CT_max = 0.3;
 dT_min = 0.01;
 dT_max = 1.00;
 tau_dT = 0.3;
@@ -109,7 +109,7 @@ if use_trim_init
 
     alpha_trim_min = -2;
     alpha_trim_max = 10;
-   alpha0 = fminbnd(@(a) (aero_coeffs(Ma0, a, dT) - CL_req0)^2, alpha_trim_min, alpha_trim_max);
+    alpha0 = fminbnd(@(a) (aero_coeffs(Ma0, a, dT) - CL_req0)^2, alpha_trim_min, alpha_trim_max);
 
     [~, CD0, ~] = aero_coeffs(Ma0, alpha0, dT);
     D0 = CD0 * qbar0 * S_ref;
@@ -131,14 +131,14 @@ if use_trim_init
     theta0 = gamma0 + deg2rad(alpha0);
     psi0   = chi0;
 
-   fprintf('Trim init: alpha0=%.3f deg, dT0=%.3f, theta0=%.3f deg\n', ...
+    fprintf('Trim init: alpha0=%.3f deg, dT0=%.3f, theta0=%.3f deg\n', ...
         alpha0, dT, theta0*180/pi);
 end
 
 %% ================= 马赫指令 =================
 M_cmd_far  = 6.5;
-M_cmd_mid  = 6.5;
-M_cmd_near = 6.5;
+M_cmd_mid  = 5.5;
+M_cmd_near = 5.0;
 V_floor    = 1100;
 
 %% ================= 终端捕获参数 =================
@@ -416,16 +416,6 @@ while k <= N_max && t_now <= T_end
     [~,~,CT] = aero_coeffs(Ma, alpha_cmd, dT);
     T_eng = CT * qbar * S_ref;
 
-    %% ================= 质量更新（正式调用独立函数） =================
-    % [m, m_fuel, mdot_f] = update_mass_model( ...
-    %     m_struct, m_fuel, Ma, alpha_cmd, 0.0, h/1000, dT, dt_use, ...
-    %     mass_model_alpha_in_deg, mdot_min, mdot_max);
-    % 
-    % if m <= m_struct
-    %     m = m_struct;
-    %     m_fuel = 0;
-    %     mdot_f = 0;
-    % end
 
     %% ================= 力与积分 =================
     if norm(v_h) > 1e-6
@@ -434,17 +424,53 @@ while k <= N_max && t_now <= T_end
         fwd = v / max(norm(v),1e-6);
     end
 
-    F_drag_e   = -D * (v/max(norm(v),1e-6));
-    F_lift_e   =  L * u_up;
-    F_thrust_e  =  T_eng * fwd;
+    % F_drag_e   = -D * (v/max(norm(v),1e-6));
+    % F_lift_e   =  L * u_up;
+    % F_thrust_e  =  T_eng * fwd;
+    % F_ecef = F_drag_e + F_lift_e + F_thrust_e;
+
+    %% ================= 力与积分（改：3D 升力方向含滚转phi） =================
+    Vmag = max(norm(v), 1e-6);
+    u_v  = v / Vmag;        % 速度方向（风轴 x）
+
+    % 右侧方向：由"天顶×速度"给出（风轴 y 的一个候选）
+    right = cross(u_up, u_v);
+    nr = norm(right);
+
+    if nr < 1e-8
+        % 如果速度几乎竖直，right 不好定义：用经东(eE)兜底
+        right = cross(u_up, eE);
+        nr = norm(right);
+    end
+    right = right / max(nr, 1e-6);     % 水平右侧单位向量
+
+    % 在速度垂直平面内的"上"方向（风轴 z，确保与u_v正交且尽量朝上）
+    lift_up = cross(u_v, right);
+    lift_up = lift_up / max(norm(lift_up), 1e-6);
+
+    % 银行角：phi>0 时升力向 right 倾斜（你前面算出来的 phi_cmd）
+    % 这里用你控制输出的 phi（第374行左右 phi=phi_cmd）
+    lift_dir = cos(phi) * lift_up + sin(phi) * right;
+    lift_dir = lift_dir / max(norm(lift_dir), 1e-6);
+
+    % 阻力沿速度反向
+    F_drag_e = -D * u_v;
+
+    % 升力沿 lift_dir
+    F_lift_e = L * lift_dir;
+
+    % 推力沿前向（你原来定义 fwd：默认取水平速度方向）
+    % 为了物理一致，这里更推荐直接用 u_v（推力沿速度方向）
+    F_thrust_e = T_eng * u_v;   % 或保持你原来的 fwd 也可以
+
     F_ecef = F_drag_e + F_lift_e + F_thrust_e;
 
     [lat_g, lon_g, h_g] = ecef2lla_cgcs2000(r');
     g_ecef = gravity_cgcs2000_ecef(lat_g, lon_g, h_g);
 
     a_ecef = g_ecef + F_ecef/m ...
-         - 2*cross(omega_ie, v) ...
-         - cross(omega_ie, cross(omega_ie, r));
+        - 2*cross(omega_ie, v) ...
+        - cross(omega_ie, cross(omega_ie, r));
 
     v = v + a_ecef*dt_use;
     r = r + v*dt_use;
@@ -625,8 +651,8 @@ slat = sind(lat0); clat = cosd(lat0);
 slon = sind(lon0); clon = cosd(lon0);
 
 C_ecef2enu = [ -slon,        clon,       0;
-               -slat*clon,  -slat*slon,   clat;
-                clat*clon,   clat*slon,   slat ];
+    -slat*clon,  -slat*slon,   clat;
+    clat*clon,   clat*slon,   slat ];
 
 dR = (Rk.' - r0);
 enu = C_ecef2enu * dR;
@@ -671,12 +697,12 @@ view(3);
 % subplot(2,1,1);
 % plot(lon_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
 % xlabel('Longitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Longitude');
-% 
+%
 % subplot(2,1,2);
 % plot(lat_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
 % xlabel('Latitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Latitude');
 
 %% ================= local functions =================
 function CL = getCL(Ma, alpha, dT)
-    [CL,~,~] = aero_coeffs(Ma, alpha, dT);
+[CL,~,~] = aero_coeffs(Ma, alpha, dT);
 end
