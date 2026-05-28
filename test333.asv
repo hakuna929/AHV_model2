@@ -73,7 +73,7 @@ int_h_lim = 8e4;
 a_h_max = 18;
 
 use_gravity_ff = true;
-a_h_bias = 1*g0;
+a_h_bias = 1.2*g0;
 
 phi_lim   = 65*pi/180;
 theta_lim = 35*pi/180;
