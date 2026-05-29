@@ -71,6 +71,15 @@ R_narrow_end = 120e3;      % m
 % 收窄平滑（0~1）函数：R从 start->end 变为 s=0->1
 narrow_smooth = @(R) min(max((R_narrow_start - R) / max(R_narrow_start - R_narrow_end, 1), 0), 1);
 
+%% ================= 编队控制（严格队形） =================
+% 说明：
+% - 领机：沿原始航点航段 L1 追 rT
+% - 僚机：不再沿航段 L1，而是对队形目标点 rT_i 做 L1/LOS 横向制导（强闭环），以严格保持菱形/V
+% - 为避免和安全屏障冲突，僚机横向指令限幅更严格一些
+
+K_form_xt = 1.0;           % 僚机横向误差增益（可调 0.5~2.0）
+a_lat_max_wing = 90;       % 僚机横向加速度限幅（m/s^2）
+
 %% ================= 初始编队布阵（V型/菱形拓扑，邻接约3km） =================
 % 用领机局部水平基：ex 指向目标水平前向，ey 水平侧向（左），ez 天顶
 u_up0 = r0/norm(r0);
@@ -208,14 +217,13 @@ R_term2          = 40e3;
 R_pass_check     = 20e3;
 R_abort_diverge  = 50e3;
 
-%% ================= 僚机航点索引（保持与单机一致的L1框架） =================
+%% ================= 僚机航点索引（保持与单机一致的L1框架；领机使用） =================
 wp_idx = 2 * ones(nVeh,1);
 r_wp_prev = repmat(wps_ecef(1,:).', 1, nVeh);
 r_wp_next = repmat(wps_ecef(2,:).', 1, nVeh);
 
 %% ================= 队形安全屏障参数 =================
 % 屏障只在 d<d_safe_min 时介入；a_rep_max 限幅，避免强烈震荡
-% 经验值：5~30 m/s^2 之间调，先取 12
 barrier_on = true;
 a_rep_max = 12;        % m/s^2
 k_rep = 1.5;           % 排斥强度（配合a_rep_max使用）
@@ -237,7 +245,7 @@ d12_hist = nan(N_max,1);
 d13_hist = nan(N_max,1);
 d24_hist = nan(N_max,1);
 d34_hist = nan(N_max,1);
-width_hist = nan(N_max,1);  % 左右翼机横向展开估计（局部ey方向）
+width_hist = nan(N_max,1);
 
 stop_reason = "completed";
 k = 1;
@@ -316,17 +324,11 @@ while k <= N_max && t_now <= T_end
     % -------- 收窄调度：邻接距离从 3000 -> 1500，且横向 |y|<=1000 --------
     s = narrow_smooth(R_to_T1);    % 0(远)->1(近)
     d_adj = (1-s)*d_adj_far + s*d_adj_near;
-    d_adj = max(d_adj, d_safe_min); % 不小于安全最小
+    d_adj = max(d_adj, d_safe_min);
 
-    % 翼机侧向偏移 y_w：远端按 y=d/2，近端受限 wing_y_max
     y_w = min(0.5*d_adj, wing_y_max);
-
-    % 为满足 1-2 距离约 d_adj，计算翼机需要的纵向后退量 x_w（沿 -ex）
     x_w = sqrt(max(d_adj^2 - y_w^2, 0));
-
-    % 后机 4：放在(2,3)之后中心，使得 2-4、3-4 距离约 d_adj
-    % 若 2/3 在 (-x_w, ±y_w)，取 4 在 (x4,0) 使得 (x4 + x_w)^2 + y_w^2 = d_adj^2
-    x4 = -x_w - sqrt(max(d_adj^2 - y_w^2, 0));  % 约等于 -2*x_w
+    x4 = -x_w - sqrt(max(d_adj^2 - y_w^2, 0));
 
     p_des = zeros(3,nVeh);
     p_des(:,1) = [0;0;0];
@@ -335,12 +337,12 @@ while k <= N_max && t_now <= T_end
     p_des(:,4) = ( x4 )*ex;
 
     rT_veh = zeros(3,nVeh);
-    rT_veh(:,1) = rT;           % 领机追真实目标
+    rT_veh(:,1) = rT;
     for iv=2:nVeh
-        rT_veh(:,iv) = r1 + p_des(:,iv);  % 僚机追队形目标点
+        rT_veh(:,iv) = r1 + p_des(:,iv);
     end
 
-    % -------- 每机控制与积分（沿用单机框架） --------
+    % -------- 每机控制与积分 --------
     for iv = 1:nVeh
         ri = r(:,iv);
         vi = v(:,iv);
@@ -370,50 +372,93 @@ while k <= N_max && t_now <= T_end
         Vh = max(norm(v_h),1e-6);
         u_vh = v_h / Vh;
 
-        % 航点切换（仍保留，以维持原L1逻辑；但对僚机主要由 rTi 引导）
+        % 航点切换（只对领机/保持兼容；僚机横向不使用航段）
         if norm(r_wp_next(:,iv) - ri) < wp_switch_dist && wp_idx(iv) < nWP
             wp_idx(iv) = wp_idx(iv) + 1;
             r_wp_prev(:,iv) = r_wp_next(:,iv);
             r_wp_next(:,iv) = wps_ecef(wp_idx(iv),:).';
         end
 
-        %% ============= 横向 L1（目标改为"本机目标点 rTi"） =============
-        % 仍使用航段方向 t_h 作为前向参考，但"距离分段"等以 R_to_T 使用 rTi
-        seg = r_wp_next(:,iv) - r_wp_prev(:,iv);
-        t_hat = seg / max(norm(seg),1e-6);
-        t_h = t_hat - dot(t_hat,u_up_i)*u_up_i;
-        t_h = t_h / max(norm(t_h),1e-6);
+        %% ============= 横向制导 =============
+        % 领机：沿航段 L1
+        % 僚机：对队形目标点 rTi 做 L1/LOS（严格队形）
 
-        r_from_start = ri - r_wp_prev(:,iv);
-        r_xt = r_from_start - dot(r_from_start,t_h)*t_h;
-        xt = norm(r_xt);
+        if iv == 1
+            seg = r_wp_next(:,iv) - r_wp_prev(:,iv);
+            t_hat = seg / max(norm(seg),1e-6);
+            t_h = t_hat - dot(t_hat,u_up_i)*u_up_i;
+            t_h = t_h / max(norm(t_h),1e-6);
 
-        if xt > 1e-6
-            n_xt = r_xt/xt;
+            r_from_start = ri - r_wp_prev(:,iv);
+            r_xt = r_from_start - dot(r_from_start,t_h)*t_h;
+            xt = norm(r_xt);
+
+            if xt > 1e-6
+                n_xt = r_xt/xt;
+            else
+                n_xt = cross(u_up_i,t_h);
+                n_xt = n_xt/max(norm(n_xt),1e-6);
+            end
+
+            r_rel_T = rTi - ri;
+            R_to_T = norm(r_rel_T);
+
+            if R_to_T < R_term2
+                L1_dist = max(8e3, 8*Vh);
+                a_lat_max = a_lat_max_term;
+            elseif R_to_T < R_term1
+                L1_dist = max(20e3, 12*Vh);
+                a_lat_max = 0.8*a_lat_max_term;
+            else
+                L1_dist = max(L1_base, L1_gainV*Vh);
+                a_lat_max = a_lat_max_cruise;
+            end
+
+            r_L1 = ri + L1_dist*t_h - min(xt,0.5*L1_dist)*n_xt;
+            u_L1 = r_L1 - ri;
+            u_L1 = u_L1 - dot(u_L1,u_up_i)*u_up_i;
+            u_L1 = u_L1 / max(norm(u_L1),1e-6);
+
         else
-            n_xt = cross(u_up_i,t_h);
-            n_xt = n_xt/max(norm(n_xt),1e-6);
+            % ===== 僚机：严格跟踪队形目标点（水平LOS + L1） =====
+            r_rel_T = rTi - ri;
+            R_to_T = norm(r_rel_T);
+
+            % 队形误差的水平分量
+            r_rel_h = r_rel_T - dot(r_rel_T,u_up_i)*u_up_i;
+            R_h = max(norm(r_rel_h),1e-6);
+            u_to_form = r_rel_h / R_h;
+
+            % 虚拟航段方向：指向队形点
+            t_h = u_to_form;
+
+            % 横向误差（与 t_h 正交的水平分量）
+            e_h = r_rel_h;
+            xt_vec = e_h - dot(e_h, t_h)*t_h;
+            xt = norm(xt_vec);
+
+            if xt > 1e-6
+                n_xt = xt_vec/xt;
+            else
+                n_xt = cross(u_up_i,t_h);
+                n_xt = n_xt/max(norm(n_xt),1e-6);
+            end
+
+            % 僚机 L1 距离：随速度变化但有限制
+            L1_dist = max(5e3, 10*Vh);
+            L1_dist = min(L1_dist, 40e3);
+
+            % 构造 L1 点：对横向误差强闭环
+            r_L1 = ri + L1_dist*t_h - min(K_form_xt*xt, 0.8*L1_dist)*n_xt;
+
+            u_L1 = r_L1 - ri;
+            u_L1 = u_L1 - dot(u_L1,u_up_i)*u_up_i;
+            u_L1 = u_L1 / max(norm(u_L1),1e-6);
+
+            a_lat_max = a_lat_max_wing;
         end
 
-        r_rel_T = rTi - ri;
-        R_to_T = norm(r_rel_T);
-
-        if R_to_T < R_term2
-            L1_dist = max(8e3, 8*Vh);
-            a_lat_max = a_lat_max_term;
-        elseif R_to_T < R_term1
-            L1_dist = max(20e3, 12*Vh);
-            a_lat_max = 0.8*a_lat_max_term;
-        else
-            L1_dist = max(L1_base, L1_gainV*Vh);
-            a_lat_max = a_lat_max_cruise;
-        end
-
-        r_L1 = ri + L1_dist*t_h - min(xt,0.5*L1_dist)*n_xt;
-        u_L1 = r_L1 - ri;
-        u_L1 = u_L1 - dot(u_L1,u_up_i)*u_up_i;
-        u_L1 = u_L1 / max(norm(u_L1),1e-6);
-
+        % 公共：由 u_L1 得到转向角 eta
         sin_eta = dot(cross(u_vh,u_L1),u_up_i);
         cos_eta = dot(u_vh,u_L1);
         eta = atan2(sin_eta,cos_eta);
@@ -474,8 +519,6 @@ while k <= N_max && t_now <= T_end
             for jv=1:nVeh
                 if jv==iv, continue; end
                 rij = ri - r(:,jv);
-
-                % 只做水平排斥（去掉u_up_i分量），避免和高度环冲突
                 rij_h = rij - dot(rij,u_up_i)*u_up_i;
                 dij = norm(rij_h);
 
@@ -624,7 +667,7 @@ while k <= N_max && t_now <= T_end
     t_now = t_now + dt_use;
     t_log(k) = t_now;
 
-    % 记录编队关键距离 & 横向展开（用当前 ex/ey 与 r1）
+    % 记录编队关键距离 & 横向展开
     r1n = r(:,1);
     r2n = r(:,2);
     r3n = r(:,3);
@@ -635,7 +678,6 @@ while k <= N_max && t_now <= T_end
     d24_hist(k) = norm(r4n - r2n);
     d34_hist(k) = norm(r4n - r3n);
 
-    % 横向展开估计：翼机在ey方向投影的差
     y2 = dot(r2n - r1n, ey);
     y3 = dot(r3n - r1n, ey);
     width_hist(k) = abs(y3 - y2);
@@ -693,9 +735,7 @@ xlabel('Time (s)'); ylabel('Wing-to-wing width (km)');
 title('横向展开约束检查');
 
 %% ================= 所有飞行器：轨迹经纬高图（LLA, Lon-Lat-Alt） =================
-% 需要：Rk 尺寸为 [N,3,nVeh]，单位 m；nVeh=4
-% 若你的 Rk 是 [N,3] 单机格式，这段会报错（需先换成4机版的Rk）
-
+Rk = Rhist(valid,:,:);
 Ntraj = size(Rk,1);
 
 lat_traj = nan(Ntraj, nVeh);
@@ -704,7 +744,8 @@ h_traj   = nan(Ntraj, nVeh);
 
 for iv = 1:nVeh
     for ii = 1:Ntraj
-        [lat_traj(ii,iv), lon_traj(ii,iv), h_traj(ii,iv)] = ecef2lla_cgcs2000( squeeze(Rk(ii,:,iv)) );
+        [lat_traj(ii,iv), lon_traj(ii,iv), h_traj(ii,iv)] = ...
+            ecef2lla_cgcs2000( squeeze(Rk(ii,:,iv)) );
     end
 end
 
@@ -716,7 +757,6 @@ for iv = 1:nVeh
         'Color', clr(iv,:), 'LineWidth', 1.5);
 end
 
-% 起点/目标标记（用领机起点/目标）
 plot3(lon0, lat0, h0/1000, 'ko', 'MarkerFaceColor','g', 'MarkerSize',7);
 plot3(lonT, latT, hT/1000, 'ko', 'MarkerFaceColor','r', 'MarkerSize',7);
 
