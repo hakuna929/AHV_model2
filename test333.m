@@ -21,7 +21,6 @@ g0 = 9.80665;
 m = 671.33;
 S_ref = 0.2986;
 
-
 %% ================= 起点/终点设置 =================
 h0 = 30e3; lat0 = 19.2; lon0 = 110.5;   % lat/lon 单位：度
 r = lla2ecef_cgcs2000(lat0, lon0, h0); r = r(:);
@@ -64,23 +63,30 @@ L1_gainV = 25;
 a_lat_max_cruise = 60;
 a_lat_max_term   = 140;
 
-% 定高
-Kph = 0.010;
-Kih = 0.00005;
-Kdh = 0.012;
-int_h = 0;
-int_h_lim = 8e4;
-a_h_max = 18;
+% ======= 定高：分段PID（按距离R_to_T） =======
+R_pid_far = 900e3;
+R_pid_mid = 250e3;
 
-use_gravity_ff = true;
-a_h_bias = 1*g0;
+PID_far.Kp = 0.010;   PID_far.Ki = 0.00004;   PID_far.Kd = 0.014;
+PID_far.int_lim = 8e4;
+PID_far.a_max   = 18;
+
+PID_mid.Kp = 0.007;   PID_mid.Ki = 0.000025;  PID_mid.Kd = 0.018;
+PID_mid.int_lim = 6e4;
+PID_mid.a_max   = 14;
+
+PID_near.Kp = 0.004;  PID_near.Ki = 0.000012; PID_near.Kd = 0.022;
+PID_near.int_lim = 4e4;
+PID_near.a_max   = 10;
+
+int_h = 0;
 
 phi_lim   = 65*pi/180;
 theta_lim = 35*pi/180;
 alpha_min = -2;
 alpha_max =  10;
 
-alpha_unload_gain = 0;
+alpha_unload_gain = 0;   % 如需饱和卸载，可改为 0.5~2.0
 
 % 速度控制
 Kpv = 0.0018;
@@ -105,7 +111,6 @@ if use_trim_init
     R0 = 6371000;   % 地球半径 m
     g = g0 * (R0/(R0+h0))^2;
     CL_req0 = m*g / (qbar0*S_ref);
-    % CL_req0 = m*g0 / max(qbar0*S_ref,1);
 
     alpha_trim_min = -2;
     alpha_trim_max = 10;
@@ -173,9 +178,6 @@ theta_hist = nan(N_max,1);
 T_hist     = nan(N_max,1);
 D_hist     = nan(N_max,1);
 L_hist     = nan(N_max,1);
-m_hist     = nan(N_max,1);
-mf_hist    = nan(N_max,1);
-mdot_hist  = nan(N_max,1);
 
 stop_reason = "completed";
 k = 1;
@@ -183,6 +185,9 @@ t_now = 0;
 
 prev_R = inf;
 min_R = inf;
+
+% 用于解耦CL_req时的滚转补偿：这里用上一时刻phi
+phi = 0; theta = 0; psi = 0;
 
 %% ================= 主循环 =================
 while k <= N_max && t_now <= T_end
@@ -295,8 +300,25 @@ while k <= N_max && t_now <= T_end
     right_h = right_h/max(norm(right_h),1e-6);
     a_lat_vec = a_lat_cmd * right_h;
 
-    %% ================= 定高（纵向） =================
+    %% ================= 高度环（分段PID + 实时重力前馈） =================
+    % 分段选择
+    if R_to_T > R_pid_far
+        PID = PID_far;
+    elseif R_to_T > R_pid_mid
+        PID = PID_mid;
+    else
+        PID = PID_near;
+    end
+    Kph = PID.Kp; Kih = PID.Ki; Kdh = PID.Kd;
+    int_h_lim = PID.int_lim;
+    a_h_max   = PID.a_max;
+
     h_cmd = 30e3;
+
+    % 实时重力（ECEF）& 沿天顶方向的向下重力大小（正数）
+    [lat_g, lon_g, h_g] = ecef2lla_cgcs2000(r');
+    g_ecef = gravity_cgcs2000_ecef(lat_g, lon_g, h_g);
+    g_up = -dot(g_ecef, u_up);
 
     v_up = dot(v,u_up);
     h_err = h_cmd - h;
@@ -304,13 +326,10 @@ while k <= N_max && t_now <= T_end
     int_h = int_h + h_err*dt_use;
     int_h = min(max(int_h,-int_h_lim),int_h_lim);
 
-    if use_gravity_ff
-        a_h_cmd = Kph*h_err + Kih*int_h - Kdh*v_up + a_h_bias;
-    else
-        a_h_cmd = Kph*h_err + Kih*int_h - Kdh*v_up;
-    end
+    % a_h_cmd 是"沿u_up方向的加速度指令"（包含重力前馈）
+    a_h_cmd = Kph*h_err + Kih*int_h - Kdh*v_up + g_up;
 
-
+    % 限幅（保留你原来近端放大一点的习惯）
     if R_to_T < R_term2
         a_h_lim_now = 1.2*a_h_max;
     else
@@ -318,7 +337,7 @@ while k <= N_max && t_now <= T_end
     end
     a_h_cmd = min(max(a_h_cmd,-a_h_lim_now),a_h_lim_now);
 
-    %% 前200s高度保护
+    % 前200s高度保护
     h_floor_200 = 29e3;
     t_protect   = 2;
     if (t_now < t_protect) && (h < h_floor_200)
@@ -326,38 +345,63 @@ while k <= N_max && t_now <= T_end
         int_h   = max(int_h, 0);
     end
 
+    % 合成指令加速度（仍保留给后面算phi）
     a_vert_vec = a_h_cmd * u_up;
     a_cmd_ecef = a_lat_vec + a_vert_vec;
-    a_cmd_norm = norm(a_cmd_ecef);
 
-    %% ================= a_cmd -> alpha/phi =================
-    CL_req = (m*a_cmd_norm)/max(qbar*S_ref,1);
+    %% ================= 解耦：用"垂向需求"反解 CL_req -> alpha_cmd =================
+    % 净向上加速度需求（气动需要提供的部分）
+    % a_up_net = a_h_cmd - g_up;
+    % 
+    % % 可选：限制向下净加速度，避免过度压杆导致耦合
+    % a_up_net = max(a_up_net, -2.0);
+    % 
+    % % 滚转导致垂向升力损失：L_up = L*cos(phi)
+    % cphi = cos(abs(phi));      % 用上一时刻phi（本循环phi_cmd还未算）
+    % cphi = max(cphi, 0.35);    % 保护，避免除0/过大放大
+    % 
+    % L_up_req = m * a_up_net;
+    % L_req = L_up_req / cphi;
+    % 
+    % CL_req = L_req / max(qbar*S_ref, 1.0);
+    % CL_req = min(max(CL_req, -0.5), 1.2);   % 可按你的气动范围调整
 
-    adeg_est = 0.0;
-    CL_alpha_deg = (0.07235 - 0.003368*Ma) * (pi/180);
-    CL_alpha_deg = max(CL_alpha_deg,0.1);
-    CL0_est = 0.1498 - 0.02751*Ma + 0.002343*Ma^2 + 0.001185*adeg_est^2;
+    % a_h_cmd 是你希望沿 u_up 的"总加速度"（如果你在PID里加了g_up前馈，它通常接近g_up）
+    a_up_total = a_h_cmd;
 
-    alpha_cmd = (CL_req - CL0_est)/CL_alpha_deg;
+    % 防止数值异常：至少保证不小于某个比例的g_up，否则会持续下沉
+    a_up_total = max(a_up_total, 0.8*g_up);
+
+    cphi = max(cos(abs(phi)), 0.35);
+    L_req  = m * a_up_total / cphi;
+    CL_req = L_req / max(qbar*S_ref, 1.0);
+
+    % 用线性近似反解alpha
+    % adeg_est = 0.0;
+    % CL_alpha_deg = (0.07235 - 0.003368*Ma) * (pi/180);
+    % CL_alpha_deg = max(CL_alpha_deg,0.1);
+    % CL0_est = 0.1498 - 0.02751*Ma + 0.002343*Ma^2 + 0.001185*adeg_est^2;
+
+    % [alpha_cmd, invInfo] = invert_alpha_from_CL(Ma, dT, CL_req, alpha_min, alpha_max);
+
+    alpha_cmd = fminbnd(@(a) (aero_coeffs(Ma, a, dT) - CL_req).^2, alpha_min, alpha_max);
+
+    % 
+    % alpha_cmd = (CL_req - CL0_est)/CL_alpha_deg;
     alpha_sat = min(max(alpha_cmd, alpha_min), alpha_max);
 
+    % 饱和卸载（可选）
     if abs(alpha_cmd - alpha_sat) > 1e-9
         over = abs(alpha_cmd - alpha_sat)/max(abs(alpha_max-alpha_min),1e-6);
         unload = min(1.0, alpha_unload_gain * (0.2 + 3.0*over));
         a_h_cmd = (1.0 - unload)*a_h_cmd;
         int_h = int_h * (1.0 - 0.5*unload);
-
-        a_vert_vec = a_h_cmd * u_up;
-        a_cmd_ecef = a_lat_vec + a_vert_vec;
-        a_cmd_norm = norm(a_cmd_ecef);
-
-        CL_req = (m*a_cmd_norm)/max(qbar*S_ref,1);
-        alpha_cmd = (CL_req - CL0_est)/CL_alpha_deg;
-        alpha_cmd = min(max(alpha_cmd, alpha_min), alpha_max);
+        alpha_cmd = alpha_sat;
     else
         alpha_cmd = alpha_sat;
     end
 
+    %% ================= a_cmd -> phi/theta/psi（保持你原结构） =================
     a_vert_req = dot(a_cmd_ecef,u_up);
     a_h_req_vec = a_cmd_ecef - a_vert_req*u_up;
     a_lat_req = dot(a_h_req_vec,right_h);
@@ -366,7 +410,7 @@ while k <= N_max && t_now <= T_end
     phi_cmd = min(max(phi_cmd,-phi_lim),phi_lim);
 
     gamma_now = atan2(v_up, Vh);
-    theta_cmd = gamma_now + alpha_cmd*cos(phi_cmd);
+    theta_cmd = gamma_now + deg2rad(alpha_cmd)*cos(phi_cmd);
     theta_cmd = min(max(theta_cmd,-theta_lim),theta_lim);
 
     chi_v = atan2(dot(u_vh,eE), dot(u_vh,eN));
@@ -417,58 +461,31 @@ while k <= N_max && t_now <= T_end
     [~,~,CT] = aero_coeffs(Ma, alpha_cmd, dT);
     T_eng = CT * qbar * S_ref;
 
-
-    %% ================= 力与积分 =================
-    if norm(v_h) > 1e-6
-        fwd = v_h / norm(v_h);
-    else
-        fwd = v / max(norm(v),1e-6);
-    end
-
-    % F_drag_e   = -D * (v/max(norm(v),1e-6));
-    % F_lift_e   =  L * u_up;
-    % F_thrust_e  =  T_eng * fwd;
-    % F_ecef = F_drag_e + F_lift_e + F_thrust_e;
-
-    %% ================= 力与积分（改：3D 升力方向含滚转phi） =================
+    %% ================= 力与积分（3D 升力方向含滚转phi） =================
     Vmag = max(norm(v), 1e-6);
-    u_v  = v / Vmag;        % 速度方向（风轴 x）
+    u_v  = v / Vmag;
 
-    % 右侧方向：由"天顶×速度"给出（风轴 y 的一个候选）
     right = cross(u_up, u_v);
     nr = norm(right);
-
     if nr < 1e-8
-        % 如果速度几乎竖直，right 不好定义：用经东(eE)兜底
         right = cross(u_up, eE);
         nr = norm(right);
     end
-    right = right / max(nr, 1e-6);     % 水平右侧单位向量
+    right = right / max(nr, 1e-6);
 
-    % 在速度垂直平面内的"上"方向（风轴 z，确保与u_v正交且尽量朝上）
     lift_up = cross(u_v, right);
     lift_up = lift_up / max(norm(lift_up), 1e-6);
 
-    % 银行角：phi>0 时升力向 right 倾斜（你前面算出来的 phi_cmd）
-    % 这里用你控制输出的 phi（第374行左右 phi=phi_cmd）
     lift_dir = cos(phi) * lift_up + sin(phi) * right;
     lift_dir = lift_dir / max(norm(lift_dir), 1e-6);
 
-    % 阻力沿速度反向
-    F_drag_e = -D * u_v;
-
-    % 升力沿 lift_dir
-    F_lift_e = L * lift_dir;
-
-    % 推力沿前向（你原来定义 fwd：默认取水平速度方向）
-    % 为了物理一致，这里更推荐直接用 u_v（推力沿速度方向）
-    F_thrust_e = T_eng * u_v;   % 或保持你原来的 fwd 也可以
+    F_drag_e   = -D * u_v;
+    F_lift_e   =  L * lift_dir;
+    F_thrust_e =  T_eng * u_v;
 
     F_ecef = F_drag_e + F_lift_e + F_thrust_e;
 
-    [lat_g, lon_g, h_g] = ecef2lla_cgcs2000(r');
-    g_ecef = gravity_cgcs2000_ecef(lat_g, lon_g, h_g);
-
+    % 复用上面高度环算的g_ecef（保持一致）
     a_ecef = g_ecef + F_ecef/m ...
         - 2*cross(omega_ie, v) ...
         - cross(omega_ie, cross(omega_ie, r));
@@ -502,15 +519,24 @@ while k <= N_max && t_now <= T_end
     T_hist(k)     = T_eng;
     D_hist(k)     = D;
     L_hist(k)     = L;
-    % m_hist(k)     = m;
-    % mf_hist(k)    = m_fuel;
-    % mdot_hist(k)  = mdot_f;
+    % ===== 新增：升力/重力对比日志 =====
+    Lmag_hist   = nan(N_max,1);   % |L| (N)
+    Wmag_hist   = nan(N_max,1);   % m*g_up (N)
+    Lup_hist    = nan(N_max,1);   % 升力在u_up方向分量 (N)
+    Wup_hist    = nan(N_max,1);   % 重力在u_up方向分量大小(向下为正) (N)
+    CLreq_hist  = nan(N_max,1);   % 你用于反解/控制的CL_req
 
-    % if any(~isfinite([r;v;Ma;qbar;CL;CD;CT;dT;m;m_fuel;mdot_f]))
-    %     stop_reason = "NaN/Inf";
-    %     fprintf('NaN/Inf at t=%.2f s\n', t_now);
-    %     break;
-    % end
+    % ===== 新增记录：升力/重力对比 =====
+    CLreq_hist(k) = CL_req;          % 你当前用的CL_req（无论线性/插值/优化反解都一样记）
+    Lmag_hist(k)  = abs(L);          % 升力大小（N）
+    Wmag_hist(k)  = m * g_up;        % 重力大小（N）
+
+    % 注意：你这里的"升力力向量"是 F_lift_e = L * lift_dir
+    % 所以其在天顶u_up方向的分量：
+    Lup_hist(k) = dot(F_lift_e, u_up);
+
+    % 重力在u_up方向的分量（向下为正）：g_ecef·u_up通常为负，所以取负号
+    Wup_hist(k) = -m * dot(g_ecef, u_up);
 
     k = k + 1;
 end
@@ -529,6 +555,11 @@ Vcmdk = Vcmd_hist(valid);
 Mcmdk = Mcmd_hist(valid);
 dTk = dT_hist(valid);
 CLk = CL_hist(valid);
+Lmagk  = Lmag_hist(valid);
+Wmagk  = Wmag_hist(valid);
+Lupk   = Lup_hist(valid);
+Wupk   = Wup_hist(valid);
+CLreqk = CLreq_hist(valid);
 CDk = CD_hist(valid);
 CTk = CT_hist(valid);
 CTffk = CTff_hist(valid);
@@ -541,23 +572,10 @@ thetak = theta_hist(valid);
 Tk     = T_hist(valid);
 Dforce = D_hist(valid);
 Lforce = L_hist(valid);
-% mk     = m_hist(valid);
-% mfk    = mf_hist(valid);
-% mdotk  = mdot_hist(valid);
 
 fprintf('Simulation stop reason: %s, t=%.2f s, min range=%.1f m\n', stop_reason, tt(end), min(Dk));
 
 %% ================= 绘图 =================
-% figure;
-% plot(tt, Dk/1000, 'm', 'LineWidth',1.7); grid on;
-% xlabel('Time (s)'); ylabel('Distance to Target (km)');
-% title('Distance to Target');
-
-% figure;
-% plot(tt, Vck, 'b', 'LineWidth',1.4); grid on; yline(0,'r--');
-% xlabel('Time (s)'); ylabel('V_c toward target (m/s)');
-% title('Closing Speed');
-
 figure;
 plot(tt, Vmk, 'k', 'LineWidth',1.4); hold on; grid on;
 plot(tt, Vcmdk, 'r--', 'LineWidth',1.2);
@@ -594,16 +612,32 @@ xlabel('Time (s)'); ylabel('C_T (actual)');
 title('CT Actual');
 
 figure;
+plot(tt, CLk, 'b', 'LineWidth',1.3); hold on; grid on;
+plot(tt, CLreqk, 'r--', 'LineWidth',1.2);
+xlabel('Time (s)'); ylabel('C_L');
+title('升力系数：C_L(实际) vs C_{L,req}');
+legend('C_L','C_{L,req}','Location','best');
+
+figure;
+plot(tt, Lmagk/1e3, 'b', 'LineWidth',1.3); hold on; grid on;
+plot(tt, Wmagk/1e3, 'r--', 'LineWidth',1.3);
+xlabel('Time (s)'); ylabel('Force (kN)');
+title('升力/重力大小对比');
+legend('|L|','m g','Location','best');
+
+figure;
+plot(tt, Lupk/1e3, 'b', 'LineWidth',1.3); hold on; grid on;
+plot(tt, Wupk/1e3, 'r--', 'LineWidth',1.3);
+xlabel('Time (s)'); ylabel('Force along u_{up} (kN)');
+title('天顶方向力平衡：L_{up} vs W_{up}');
+legend('L_{up}','W_{up}','Location','best');
+
+figure;
 plot(tt, CLk, 'b', 'LineWidth',1.2); hold on; grid on;
 plot(tt, CDk, 'r--', 'LineWidth',1.2);
 xlabel('Time (s)'); ylabel('Coefficient');
 title('升阻比');
 legend('C_L','C_D','Location','best');
-
-figure;
-plot(tt, L1k/1000, 'LineWidth',1.3); grid on;
-xlabel('Time (s)'); ylabel('L1 distance (km)');
-title('L1距离');
 
 figure;
 plot(tt, alatk, 'LineWidth',1.3); grid on;
@@ -614,35 +648,6 @@ figure;
 plot(tt, Tk, 'LineWidth',1.3); grid on;
 xlabel('Time (s)'); ylabel('Thrust (N)');
 title('发动机推力');
-
-% figure;
-% plot(tt, (Tk - Dforce), 'LineWidth',1.3); grid on;
-% xlabel('Time (s)'); ylabel('(T - D) (N)');
-% title('Excess Thrust');
-
-% figure;
-% plot(tt, mk, 'LineWidth',1.3); grid on;
-% xlabel('Time (s)'); ylabel('Mass (kg)');
-% title('Total Mass');
-
-% figure;
-% plot(tt, mfk, 'LineWidth',1.3); grid on;
-% xlabel('Time (s)'); ylabel('Fuel Mass (kg)');
-% title('Fuel Mass');
-
-% figure;
-% plot(tt, mdotk, 'LineWidth',1.3); grid on;
-% xlabel('Time (s)'); ylabel('Fuel Mass Flow (kg/s)');
-% title('燃料消耗');
-
-% figure;
-% plot3(Rk(:,1)/1e3, Rk(:,2)/1e3, Rk(:,3)/1e3, 'b','LineWidth',1.3); hold on; grid on; axis equal;
-% [xe,ye,ze] = sphere(60);
-% surf(Re*xe/1e3, Re*ye/1e3, Re*ze/1e3, 'FaceAlpha',0.08,'EdgeColor','none');
-% plot3(rT(1)/1e3, rT(2)/1e3, rT(3)/1e3, 'ro','MarkerFaceColor','r');
-% xlabel('X_{ECEF} (km)'); ylabel('Y_{ECEF} (km)'); zlabel('Z_{ECEF} (km)');
-% title('Trajectory in ECEF');
-% legend('Vehicle','Earth','Target','Location','best');
 
 %% ================= 绘图（发射系 ENU） =================
 r0 = lla2ecef_cgcs2000(lat0, lon0, h0).';
@@ -677,14 +682,6 @@ for ii = 1:Ntraj
     [lat_traj(ii), lon_traj(ii), h_traj(ii)] = ecef2lla_cgcs2000(Rk(ii,:));
 end
 
-% figure;
-% plot(lon_traj, lat_traj, 'b', 'LineWidth', 1.5); grid on; hold on;
-% plot(lon0, lat0, 'go', 'MarkerFaceColor','g');
-% plot(lonT, latT, 'ro', 'MarkerFaceColor','r');
-% xlabel('Longitude (deg)'); ylabel('Latitude (deg)');
-% title('Trajectory Ground Track (Lat/Lon)');
-% legend('Trajectory','Launch','Target','Location','best');
-
 figure;
 plot3(lon_traj, lat_traj, h_traj/1000, 'b', 'LineWidth', 1.5); grid on; hold on;
 plot3(lon0, lat0, h0/1000, 'go', 'MarkerFaceColor','g');
@@ -693,17 +690,3 @@ xlabel('Longitude (deg)'); ylabel('Latitude (deg)'); zlabel('Altitude (km)');
 title('经纬高轨迹 LLA (Lon-Lat-Alt)');
 legend('Trajectory','Launch','Target','Location','best');
 view(3);
-
-% figure;
-% subplot(2,1,1);
-% plot(lon_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
-% xlabel('Longitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Longitude');
-%
-% subplot(2,1,2);
-% plot(lat_traj, h_traj/1000, 'LineWidth', 1.3); grid on;
-% xlabel('Latitude (deg)'); ylabel('Altitude (km)'); title('Altitude vs Latitude');
-
-%% ================= local functions =================
-function CL = getCL(Ma, alpha, dT)
-[CL,~,~] = aero_coeffs(Ma, alpha, dT);
-end
