@@ -624,8 +624,6 @@ while k <= N_max && t_now <= T_end
         if use_station_keeping && iv ~= 1
             % >0: 僚机在ex方向更快（会继续超前）
             ev_x = dot(v(:,iv) - v(:,1), ex);
-      
-          
 
             dV_target = -Kx_v * e_x(iv) - Kvd_v * ev_x;
             dV_target = min(max(dV_target, -dV_max), dV_max);
